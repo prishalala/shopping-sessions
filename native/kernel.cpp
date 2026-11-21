@@ -514,9 +514,13 @@ struct Ev {  // valid event, routed by person
   uint32_t person, price, slot;
   uint16_t cat, pad;
 };
-struct Dd {  // any well-formed event with an ID, routed by dedup slot
-  uint32_t local, pad;
-  const char* line;
+// Any well-formed event with an ID, routed by dedup slot. Packed:
+// bits 0-19 chunk, 20-43 offset within chunk, 44-63 local bitmap index.
+struct Dd {
+  uint64_t v;
+  uint32_t local() const { return uint32_t(v >> 44); }
+  uint32_t chunk() const { return uint32_t(v & 0xFFFFF); }
+  uint32_t offset() const { return uint32_t((v >> 20) & 0xFFFFFF); }
 };
 struct Ck {  // valid click, routed by person
   Time ts;
@@ -524,6 +528,42 @@ struct Ck {  // valid click, routed by person
   const char* id;
   uint32_t idlen, pad;
 };
+// Stable LSD radix sort of (key, idx) pairs on a 32-bit key, 11/11/10 bits.
+struct KI {
+  uint32_t key, idx;
+};
+static void radix32(std::vector<KI>& a, std::vector<KI>& tmp) {
+  size_t n = a.size();
+  tmp.resize(n);
+  static thread_local uint32_t hist[3][2048];
+  memset(hist, 0, sizeof(hist));
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t k = a[i].key;
+    ++hist[0][k & 2047];
+    ++hist[1][(k >> 11) & 2047];
+    ++hist[2][k >> 22];
+  }
+  for (int d = 0; d < 3; ++d) {
+    uint32_t sum = 0;
+    for (int b = 0; b < 2048; ++b) {
+      uint32_t c = hist[d][b];
+      hist[d][b] = sum;
+      sum += c;
+    }
+  }
+  KI* src = a.data();
+  KI* dst = tmp.data();
+  for (int d = 0; d < 3; ++d) {
+    int shift = d * 11;
+    for (size_t i = 0; i < n; ++i) {
+      uint32_t b = d == 2 ? (src[i].key >> 22) : ((src[i].key >> shift) & 2047);
+      dst[hist[d][b]++] = src[i];
+    }
+    std::swap(src, dst);
+  }
+  if (src != a.data()) memcpy(a.data(), src, n * sizeof(KI));
+}
+
 struct SE {
   Time ts;
   uint32_t price, cat;
@@ -751,10 +791,12 @@ struct Worker {
   Column u_revenue{"revenue_cents", INT64, NOLOGICAL, false, {}, {}, 0};
   Column u_top{"top_category", BYTE_ARRAY, STRING, true, {}, {}, 0};
   size_t rows = 0;
+  double tm[5] = {0, 0, 0, 0, 0};
   // scratch
   std::vector<uint32_t> li, cnt, persons, cli, ccnt;
   std::vector<SE> stage, sorted;
   std::vector<SC> cstage, csorted;
+  std::vector<KI> ki, kitmp;
 };
 
 struct Global {
@@ -1024,10 +1066,13 @@ int main() {
   // Sizing.
   const size_t P = std::clamp<size_t>(pow2_at_least(events.bytes / (4 << 20)), 64, 2048);
   const int logP = log2_of(P);
-  const size_t D = P;
   const size_t est_event_lines = events.bytes / 60 + 1024;
   const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 16),
                                          size_t(1) << 22, size_t(1) << 32);
+  const size_t D = std::max(P, BITS >> 20);  // local bitmap index fits 20 bits
+  if (events.chunks.size() >= (size_t(1) << 20)) die("too many event chunks");
+  for (auto& c : events.chunks)
+    if (size_t(c.end - c.begin) >= (size_t(1) << 24)) die("event line over 16 MB");
   const int logBITS = log2_of(BITS);
   const int logLocal = logBITS - log2_of(D);
   const size_t local_bits = size_t(1) << logLocal;
@@ -1078,15 +1123,38 @@ int main() {
           }
         }
       mark("links-union");
-      std::vector<uint32_t> best(n);
-      for (uint32_t i = 0; i < n; ++i) best[i] = i;
-      for (uint32_t i = 0; i < n; ++i) {
-        uint32_t r = find(i);
-        if (r != i && ids.strs[i] < ids.strs[best[r]]) best[r] = i;
-      }
-      for (uint32_t i = 0; i < n; ++i)
-        if (!ids.strs[i].empty() || best[find(i)] != i)
-          ids.slots[ids.slot_of[i]].person = best[find(i)];
+      // Full path compression in parallel (read-only walks), then a parallel
+      // byte-wise minimum per component with CAS.
+      std::vector<uint32_t> root(n);
+      parallel((n + 65535) / 65536, [&](int, size_t b) {
+        uint32_t lo = uint32_t(b * 65536), hi = std::min<uint32_t>(n, lo + 65536);
+        for (uint32_t i = lo; i < hi; ++i) {
+          uint32_t x = i;
+          while (parent[x] != x) x = parent[x];
+          root[i] = x;
+        }
+      });
+      std::vector<uint32_t> best(root);  // a component's root starts as its best
+      parallel((n + 65535) / 65536, [&](int, size_t b) {
+        uint32_t lo = uint32_t(b * 65536), hi = std::min<uint32_t>(n, lo + 65536);
+        for (uint32_t i = lo; i < hi; ++i) {
+          uint32_t r = root[i];
+          if (r == i) continue;
+          uint32_t cur = __atomic_load_n(&best[r], __ATOMIC_RELAXED);
+          while (ids.strs[i] < ids.strs[cur] &&
+                 !__atomic_compare_exchange_n(&best[r], &cur, i, false,
+                                              __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+          }
+        }
+      });
+      parallel((n + 65535) / 65536, [&](int, size_t b) {
+        uint32_t lo = uint32_t(b * 65536), hi = std::min<uint32_t>(n, lo + 65536);
+        for (uint32_t i = lo; i < hi; ++i) {
+          uint32_t r = root[i];
+          if (r == i && best[r] == i) continue;  // singleton or own best
+          ids.slots[ids.slot_of[i]].person = best[r];
+        }
+      });
     }
     mark("links");
 
@@ -1140,7 +1208,8 @@ int main() {
           uint64_t h = hash_text(f[0]);
           uint32_t g = uint32_t(h & (BITS - 1));
           dd[size_t(w) * D + (g >> logLocal)].push_back(
-              {uint32_t(g & (local_bits - 1)), 0, line});
+              {(uint64_t(g & (local_bits - 1)) << 44) |
+               (uint64_t(line - c.begin) << 20) | job});
           if (f[1].empty() || f[5].empty()) continue;
           uint32_t price = 0;
           bool purchase = false;
@@ -1212,10 +1281,11 @@ int main() {
       uint64_t* r = rep + d * wpp;
       for (int t = 0; t < T; ++t)
         for (const Dd& x : dd[size_t(t) * D + d]) {
-          uint64_t bit = uint64_t(1) << (x.local & 63);
-          uint64_t& sw = s[x.local >> 6];
+          uint32_t lc = x.local();
+          uint64_t bit = uint64_t(1) << (lc & 63);
+          uint64_t& sw = s[lc >> 6];
           if (sw & bit)
-            r[x.local >> 6] |= bit;
+            r[lc >> 6] |= bit;
           else
             sw |= bit;
         }
@@ -1223,7 +1293,8 @@ int main() {
       list.clear();
       for (int t = 0; t < T; ++t)
         for (const Dd& x : dd[size_t(t) * D + d])
-          if ((r[x.local >> 6] >> (x.local & 63)) & 1) list.push_back(x.line);
+          if ((r[x.local() >> 6] >> (x.local() & 63)) & 1)
+            list.push_back(events.chunks[x.chunk()].begin + x.offset());
       if (list.empty()) return;
       auto& tb = table[w];
       size_t cap = pow2_at_least(list.size() * 2 + 16);
@@ -1297,6 +1368,14 @@ int main() {
     W.first.assign(G.ncamp, 0);
     W.pos.assign(G.ncamp, 0);
     W.catsum.assign(G.cat_names.size(), 0);
+    size_t rows_est = events.bytes / 80 / 9 / size_t(T) + 1024;
+    W.u_user.data.reserve(rows_est * 16);
+    W.u_day.data.reserve(rows_est * 4);
+    W.u_sessions.data.reserve(rows_est * 8);
+    W.u_events.data.reserve(rows_est * 8);
+    W.u_revenue.data.reserve(rows_est * 8);
+    W.u_top.data.reserve(rows_est * 4);
+    W.u_top.def.reserve(rows_est / 8 + 8);
   }
   std::vector<std::pair<size_t, size_t>> order(P);
   for (size_t p = 0; p < P; ++p) {
@@ -1305,9 +1384,12 @@ int main() {
     order[p] = {s, p};
   }
   std::sort(order.rbegin(), order.rend());
+  // Relative times fit 32 bits whenever the click window spans < ~49 days.
+  const bool fast_sort = (G.we - (G.ws - WEEK)) < (Time(1) << 32);
   mark("sessions-setup");
   parallel(P, [&](int w, size_t job) {
     size_t p = order[job].second;
+    double tjob = now();
     Worker& W = workers[w];
     auto& li = W.li;
     auto& cnt = W.cnt;
@@ -1342,6 +1424,7 @@ int main() {
       AVec<Ev>().swap(ev[size_t(t) * P + p]);
       for (const Ev& e : winners[size_t(t) * P + p]) take(e);
     }
+    double tg = now();
     size_t np = persons.size();
     if (!np) return;
     // counting sort events by local person
@@ -1351,9 +1434,19 @@ int main() {
     sorted.resize(stage.size());
     {
       std::vector<uint32_t> at(start.begin(), start.end() - 1);
-      for (size_t k = 0; k < stage.size(); ++k) sorted[at[li[k]]++] = stage[k];
+      if (fast_sort) {
+        auto& ki = W.ki;
+        ki.resize(stage.size());
+        for (size_t k = 0; k < stage.size(); ++k)
+          ki[k] = {uint32_t(stage[k].ts - G.ws), uint32_t(k)};
+        radix32(ki, W.kitmp);
+        for (const KI& x : ki) sorted[at[li[x.idx]]++] = stage[x.idx];
+      } else {
+        for (size_t k = 0; k < stage.size(); ++k) sorted[at[li[k]]++] = stage[k];
+      }
     }
     // clicks
+    double ts1 = now();
     auto& cli = W.cli;
     auto& ccnt = W.ccnt;
     auto& cstage = W.cstage;
@@ -1379,20 +1472,40 @@ int main() {
     csorted.resize(cstage.size());
     {
       std::vector<uint32_t> at(cstart.begin(), cstart.end() - 1);
-      for (size_t k = 0; k < cstage.size(); ++k)
-        csorted[at[cli[k]]++] = cstage[k];
+      if (fast_sort) {
+        auto& ki = W.ki;
+        ki.resize(cstage.size());
+        for (size_t k = 0; k < cstage.size(); ++k)
+          ki[k] = {uint32_t(cstage[k].ts - (G.ws - WEEK)), uint32_t(k)};
+        radix32(ki, W.kitmp);
+        for (const KI& x : ki) csorted[at[cli[x.idx]]++] = cstage[x.idx];
+      } else {
+        for (size_t k = 0; k < cstage.size(); ++k)
+          csorted[at[cli[k]]++] = cstage[k];
+      }
     }
+    double ts2 = now();
     for (size_t k = 0; k < np; ++k) {
       SE* e = sorted.data() + start[k];
       size_t n = start[k + 1] - start[k];
       SC* c = csorted.data() + cstart[k];
       size_t m = cstart[k + 1] - cstart[k];
-      std::sort(e, e + n, [](const SE& a, const SE& b) { return a.ts < b.ts; });
-      std::sort(c, c + m, [](const SC& a, const SC& b) { return a.ts < b.ts; });
+      if (!fast_sort) {
+        std::sort(e, e + n, [](const SE& a, const SE& b) { return a.ts < b.ts; });
+        std::sort(c, c + m, [](const SC& a, const SC& b) { return a.ts < b.ts; });
+      }
       sweep(W, G, ids.strs[persons[k]], e, n, c, m);
     }
+    double ts3 = now();
+    W.tm[0] += tg - tjob; W.tm[1] += ts1 - tg; W.tm[2] += ts2 - ts1; W.tm[3] += ts3 - ts2;
   });
   mark("sessions");
+  if (verbose) {
+    double tm[4] = {0, 0, 0, 0};
+    for (auto& W : workers) for (int i = 0; i < 4; ++i) tm[i] += W.tm[i];
+    double sw = 0; for (auto& W : workers) sw += W.tm[4];
+    fprintf(stderr, "  cpu: gather %.3f  ev-sort %.3f  clicks %.3f  sort+sweep %.3f  sweep %.3f\n", tm[0], tm[1], tm[2], tm[3], sw);
+  }
 
   // ---- outputs
   std::string ud = out + "/user_daily", cd = out + "/campaign_daily";
