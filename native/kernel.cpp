@@ -288,10 +288,21 @@ static inline uint64_t hash_text(Text s) {
 
 // ---------------------------------------------------------------- inputs
 
+// A byte range of one file region. Lines that START in [begin, end) belong to
+// the chunk; when !aligned, begin may be mid-line and the worker skips to the
+// next line start. Every line before `limit` ends with '\n' before `limit`.
 struct Chunk {
   const char* begin;
-  const char* end;  // every line in [begin, end) ends with '\n'
+  const char* end;
+  const char* limit;
+  bool aligned;
 };
+static inline const char* first_line(const Chunk& c) {
+  if (c.aligned) return c.begin;
+  const char* nl = static_cast<const char*>(
+      memchr(c.begin - 1, '\n', size_t(c.limit - c.begin + 1)));
+  return nl ? nl + 1 : c.limit;
+}
 struct Input {
   std::vector<Chunk> chunks;
   size_t bytes = 0;
@@ -307,7 +318,10 @@ static const char* map_file(const std::string& path, size_t& size) {
     close(fd);
     return nullptr;
   }
-  void* p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+  static const bool populate = getenv("KERNEL_POPULATE") != nullptr;
+  void* p = mmap(nullptr, size, PROT_READ,
+                 MAP_PRIVATE | (populate ? MAP_POPULATE : 0), fd, 0);
+
   close(fd);
   if (p == MAP_FAILED) die("mmap", path);
   return static_cast<const char*>(p);
@@ -331,23 +345,16 @@ static void add_mapped(Input& in, const Mapped& mf, size_t chunk_size) {
   const char* p = nl + 1;
   const char* tail = end - std::min<size_t>(size_t(end - p), 64);
   while (tail > p && tail[-1] != '\n') --tail;
-  while (p < tail) {
-    const char* e = tail;
-    if (size_t(tail - p) > chunk_size) {
-      const char* f = static_cast<const char*>(
-          memchr(p + chunk_size, '\n', size_t(tail - p - chunk_size)));
-      if (f) e = f + 1;
-    }
-    in.chunks.push_back({p, e});
-    p = e;
-  }
+  // Fixed byte ranges: no scanning here, so no page is touched up front.
+  for (const char* lo = p; lo < tail; lo += std::min(chunk_size, size_t(tail - lo)))
+    in.chunks.push_back({lo, lo + std::min(chunk_size, size_t(tail - lo)), tail, lo == p});
   if (tail < end) {
     size_t n = size_t(end - tail);
     char* buf = static_cast<char*>(malloc(n + 72));
     memcpy(buf, tail, n);
     if (buf[n - 1] != '\n') buf[n++] = '\n';
     memset(buf + n, 0, 64);
-    in.chunks.push_back({buf, buf + n});
+    in.chunks.push_back({buf, buf + n, buf + n, true});
   }
 }
 
@@ -372,7 +379,7 @@ template <int N, class Fn>
 static void each_row(const Chunk& c, Fn fn) {
   Text f[N];
   bool ok;
-  for (const char* p = c.begin; p < c.end;) {
+  for (const char* p = first_line(c); p < c.end;) {
     p = split<N>(p, f, ok);
     if (ok) fn(f);
   }
@@ -1008,6 +1015,19 @@ int main() {
       Mapped& mf = files[order[k]].second;
       mf.data = map_file(mf.path, mf.size);
     });
+    // Read-ahead hints run in the background, links first, so parsing starts
+    // at once and page-cache misses overlap with work.
+    if (!getenv("KERNEL_POPULATE")) {
+      std::vector<std::pair<const char*, size_t>> hint;
+      for (int pass = 0; pass < 2; ++pass)
+        for (auto& [in, mf] : files)
+          if (mf.data && ((in == &links) == (pass == 0)))
+            hint.push_back({mf.data, mf.size});
+      std::thread([hint] {
+        for (auto [d, n] : hint)
+          madvise(const_cast<char*>(d), n, MADV_WILLNEED);
+      }).detach();
+    }
     for (auto& [in, mf] : files)
       add_mapped(*in, mf, in == &products || in == &campaigns ? SIZE_MAX : CHUNK);
   }
@@ -1201,7 +1221,7 @@ int main() {
       };
       if (job < nev) {
         const Chunk& c = events.chunks[job];
-        for (const char* p = c.begin; p < c.end;) {
+        for (const char* p = first_line(c); p < c.end;) {
           const char* line = p;
           p = split<7>(p, f, ok);
           if (!ok || f[0].empty()) continue;
@@ -1241,7 +1261,7 @@ int main() {
         flush_ev();
       } else {
         const Chunk& c = clicks.chunks[job - nev];
-        for (const char* p = c.begin; p < c.end;) {
+        for (const char* p = first_line(c); p < c.end;) {
           p = split<4>(p, f, ok);
           if (!ok || f[0].empty() || f[1].empty()) continue;
           uint32_t camp = campaign.find(f[2]);
