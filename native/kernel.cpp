@@ -1059,6 +1059,7 @@ int main() {
       });
       if (ids.overflow) continue;
       uint32_t n = std::min(ids.next.load(), ids.cap);
+      mark("links-parsed");
       std::vector<uint32_t> parent(n);
       for (uint32_t i = 0; i < n; ++i) parent[i] = i;
       auto find = [&](uint32_t x) {
@@ -1076,6 +1077,7 @@ int main() {
             parent[x] = y;
           }
         }
+      mark("links-union");
       std::vector<uint32_t> best(n);
       for (uint32_t i = 0; i < n; ++i) best[i] = i;
       for (uint32_t i = 0; i < n; ++i) {
@@ -1108,10 +1110,29 @@ int main() {
     parallel(nev + clicks.chunks.size(), [&](int w, size_t job) {
       Text f[7];
       bool ok;
+      // Rows wait in a small batch so that their ID-slot misses overlap.
+      constexpr int BATCH = 16;
+      struct PE { Text user; uint64_t h; Ev e; } pend[BATCH];
+      struct PC { Text user; uint64_t h; Ck c; } cpend[BATCH];
+      int np = 0;
+      auto flush_ev = [&]() {
+        for (int k = 0; k < np; ++k) {
+          Ev e = pend[k].e;
+          e.person = ids.get(pend[k].user, pend[k].h, w)->person;
+          ev[size_t(w) * P + ppart(e.person)].push_back(e);
+        }
+        np = 0;
+      };
+      auto flush_ck = [&]() {
+        for (int k = 0; k < np; ++k) {
+          Ck c = cpend[k].c;
+          c.person = ids.get(cpend[k].user, cpend[k].h, w)->person;
+          ck[size_t(w) * P + ppart(c.person)].push_back(c);
+        }
+        np = 0;
+      };
       if (job < nev) {
         const Chunk& c = events.chunks[job];
-        Ev* dummy = nullptr;
-        (void)dummy;
         for (const char* p = c.begin; p < c.end;) {
           const char* line = p;
           p = split<7>(p, f, ok);
@@ -1143,10 +1164,12 @@ int main() {
             cat = product.find(f[5]);
             if (cat == NONE) cat = UNKNOWN_CAT;
           }
-          uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
-          ev[size_t(w) * P + ppart(person)].push_back(
-              {ts, person, price, g, uint16_t(cat), 0});
+          uint64_t uh = hash_text(f[1]);
+          __builtin_prefetch(ids.slots + (uh & ids.mask));
+          pend[np++] = {f[1], uh, {ts, 0, price, g, uint16_t(cat), 0}};
+          if (np == BATCH) flush_ev();
         }
+        flush_ev();
       } else {
         const Chunk& c = clicks.chunks[job - nev];
         for (const char* p = c.begin; p < c.end;) {
@@ -1156,10 +1179,12 @@ int main() {
           if (camp == NONE) continue;
           Time ts = timestamp(f[3]);
           if (ts < cws || ts >= we) continue;
-          uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
-          ck[size_t(w) * P + ppart(person)].push_back(
-              {ts, person, camp, f[0].data(), uint32_t(f[0].size()), 0});
+          uint64_t uh = hash_text(f[1]);
+          __builtin_prefetch(ids.slots + (uh & ids.mask));
+          cpend[np++] = {f[1], uh, {ts, 0, camp, f[0].data(), uint32_t(f[0].size()), 0}};
+          if (np == BATCH) flush_ck();
         }
+        flush_ck();
       }
     });
     if (ids.overflow) continue;
@@ -1280,6 +1305,7 @@ int main() {
     order[p] = {s, p};
   }
   std::sort(order.rbegin(), order.rend());
+  mark("sessions-setup");
   parallel(P, [&](int w, size_t job) {
     size_t p = order[job].second;
     Worker& W = workers[w];
