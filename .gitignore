@@ -1,0 +1,14 @@
+.venv/
+starter-polars/
+generator/
+*.zip
+dev/
+dev-answer/
+bench*/
+out*/
+scratch*/
+__pycache__/
+target/
+.local/
+*.parquet
+.ruff_cache/
