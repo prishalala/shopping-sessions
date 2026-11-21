@@ -84,7 +84,8 @@ static void* alloc_zero(size_t bytes) {
 // carved into per-thread slabs. Freeing is a no-op; the process exits soon.
 static char* arena_base;
 static std::atomic<size_t> arena_used{0};
-static constexpr size_t ARENA = size_t(96) << 30, SLAB = size_t(64) << 20;
+static size_t ARENA = size_t(96) << 30;
+static constexpr size_t SLAB = size_t(64) << 20;
 static thread_local char* slab_at = nullptr;
 static thread_local char* slab_end = nullptr;
 static void* arena_take(size_t bytes) {
@@ -147,29 +148,130 @@ inline int two(const char* s) {
   return (a > 9 || b > 9) ? -10000 : int(a * 10 + b);
 }
 
-inline Time timestamp(Text s) {
-  if (!((s.size() == 20 || s.size() == 25) && s[4] == '-'))
-    return decimal(s, INT64_MAX);
-  if (s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') return BAD;
-  const char* p = s.data();
-  int y = two(p) * 100 + two(p + 2), m = two(p + 5), d = two(p + 8);
-  int hour = two(p + 11), minute = two(p + 14), sec = two(p + 17);
-  if (y < 1 || m < 1 || m > 12 || d < 1 || hour < 0 || hour > 23 ||
-      minute < 0 || minute > 59 || sec < 0 || sec > 59)
-    return BAD;
-  static constexpr int lengths[] = {31, 28, 31, 30, 31, 30,
-                                    31, 31, 30, 31, 30, 31};
-  bool leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-  if (d > lengths[m - 1] + (m == 2 && leap)) return BAD;
-  int offset = 0;
-  if (s.size() == 20) {
-    if (s[19] != 'Z') return BAD;
-  } else {
-    if ((s[19] != '+' && s[19] != '-') || s[22] != ':') return BAD;
-    int h = two(p + 20), n = two(p + 23);
-    if (h < 0 || h > 23 || n < 0 || n > 59) return BAD;
-    offset = (h * 60 + n) * (s[19] == '+' ? 1 : -1);
+// ---- fast timestamp parsing (SWAR). Reads up to 8 bytes before an F3 value
+// and up to 4 bytes past an F1 value; callers guarantee both are readable
+// (fields never start a buffer: every input buffer has 16 leading bytes of
+// padding, and the manifest is copied into a padded buffer).
+static inline uint64_t ld64u(const char* p) {
+  uint64_t v;
+  memcpy(&v, p, 8);
+  return v;
+}
+static inline uint32_t ld32u(const char* p) {
+  uint32_t v;
+  memcpy(&v, p, 4);
+  return v;
+}
+constexpr uint64_t SW_K = 0x7676767676767676ULL, SW_H = 0x8080808080808080ULL;
+// Every byte of d (already XORed with '0') is a decimal digit value 0..9.
+static inline bool all_digits(uint64_t d) { return (((d + SW_K) | d) & SW_H) == 0; }
+// Eight digit values, most significant in the lowest byte -> integer.
+static inline uint64_t digits8(uint64_t d) {
+  d = (d * 10) + (d >> 8);
+  d = (((d & 0x000000FF000000FFULL) * (100 + (1000000ULL << 32))) +
+       (((d >> 16) & 0x000000FF000000FFULL) * (1 + (10000ULL << 32)))) >> 32;
+  return d;
+}
+
+// Exact scalar fallback for F3 values with many digits or leading zeros.
+static Time decimal_slow(Text s) { return decimal(s, INT64_MAX); }
+
+static inline Time epoch_ms(const char* p, size_t n) {
+  if (n == 0 || n > 16) return decimal_slow(Text(p, n));
+  constexpr uint64_t Z = 0x3030303030303030ULL;
+  if (n > 8) {
+    size_t k = n - 8;  // 1..8 leading digits
+    uint64_t lo = ld64u(p + k) ^ Z;
+    uint64_t hi = ld64u(p + k - 8) ^ Z;
+    hi = k == 8 ? hi : (hi & (~uint64_t(0) << (8 * (8 - k))));  // zero bytes before p
+    if (!all_digits(lo) || !all_digits(hi)) return BAD;
+    return Time(digits8(hi) * 100000000ULL + digits8(lo));
   }
+  uint64_t v = ld64u(p + n - 8) ^ Z;
+  v = n == 8 ? v : (v & (~uint64_t(0) << (8 * (8 - n))));
+  if (!all_digits(v)) return BAD;
+  return Time(digits8(v));
+}
+
+// Month table for the fast path (filled once the window is known; empty until
+// then, so every lookup falls back to the general formula).
+struct MonthInfo {
+  int64_t first_day;  // days since 1970-01-01 of the month's first day
+  int length;
+};
+constexpr int MONTHS = 48;
+static MonthInfo g_months[MONTHS];
+static int g_month_base = INT32_MIN / 2;  // y * 12 + (m - 1) of g_months[0]
+static int64_t civil_days(int y, int m, int d) {
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400, yr = y - era * 400;
+  return int64_t(era) * 146097 + yr * 365 + yr / 4 - yr / 100 +
+         (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1 - 719468;
+}
+static void init_months(int64_t day0) {
+  // Find the civil year/month of day0, then start the table two years earlier.
+  int y = int(1970 + day0 / 365) + 1;
+  while (civil_days(y, 1, 1) > day0) --y;
+  int base = (y - 2) * 12;
+  static constexpr int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  for (int k = 0; k < MONTHS; ++k) {
+    int yy = (base + k) / 12, mm = (base + k) % 12 + 1;
+    if (yy < 1) {  // never use the table below year 1
+      g_month_base = INT32_MIN / 2;
+      return;
+    }
+    bool leap = yy % 4 == 0 && (yy % 100 != 0 || yy % 400 == 0);
+    g_months[k] = {civil_days(yy, mm, 1), lengths[mm - 1] + (mm == 2 && leap)};
+  }
+  g_month_base = base;
+}
+
+inline Time timestamp(Text s) {
+  const char* p = s.data();
+  size_t n = s.size();
+  if (!((n == 20 || n == 25) && p[4] == '-')) return epoch_ms(p, n);
+  // "YYYY-MM-" and "DDTHH:MM"
+  uint64_t a = ld64u(p) ^ 0x2D30302D30303030ULL;
+  uint64_t b = ld64u(p + 8) ^ 0x30303A3030543030ULL;
+  if (!all_digits(a) || !all_digits(b)) return BAD;
+  if ((a & 0xFF0000FF00000000ULL) | (b & 0x0000FF0000FF0000ULL)) return BAD;
+  int y = int((a & 0xFF) * 1000 + ((a >> 8) & 0xFF) * 100 + ((a >> 16) & 0xFF) * 10 +
+              ((a >> 24) & 0xFF));
+  int m = int(((a >> 40) & 0xFF) * 10 + ((a >> 48) & 0xFF));
+  int d = int((b & 0xFF) * 10 + ((b >> 8) & 0xFF));
+  int hour = int(((b >> 24) & 0xFF) * 10 + ((b >> 32) & 0xFF));
+  int minute = int(((b >> 48) & 0xFF) * 10 + ((b >> 56) & 0xFF));
+  int sec, offset = 0;
+  if (n == 20) {
+    uint32_t c = ld32u(p + 16) ^ 0x5A30303AU;  // ":SSZ"
+    if ((c & 0xFF0000FFU) || ((c >> 8) & 0xFF) > 9 || ((c >> 16) & 0xFF) > 9) return BAD;
+    sec = int(((c >> 8) & 0xFF) * 10 + ((c >> 16) & 0xFF));
+  } else {
+    // ":SS+HH:M" then the final minute digit
+    char sign = p[19];
+    if (sign != '+' && sign != '-') return BAD;
+    uint64_t c = (ld64u(p + 16) ^ 0x303A30302B30303AULL) & ~0x00000000FF000000ULL;
+    unsigned last = unsigned(uint8_t(p[24])) - '0';
+    if (!all_digits(c) || (c & 0xFF0000000000FFULL) || last > 9) return BAD;
+    sec = int(((c >> 8) & 0xFF) * 10 + ((c >> 16) & 0xFF));
+    int oh = int(((c >> 32) & 0xFF) * 10 + ((c >> 40) & 0xFF));
+    int om = int(((c >> 56) & 0xFF) * 10 + int(last));
+    if (oh > 23 || om > 59) return BAD;
+    offset = (oh * 60 + om) * (sign == '+' ? 1 : -1);
+  }
+  if (y < 1 || m < 1 || m > 12 || d < 1 || hour > 23 || minute > 59 || sec > 59) return BAD;
+  // Fast path: months near the window come from a precomputed table.
+  {
+    int k = y * 12 + (m - 1) - g_month_base;
+    if (unsigned(k) < unsigned(MONTHS)) {
+      const MonthInfo& mi = g_months[k];
+      if (d > mi.length) return BAD;
+      return (mi.first_day + d - 1) * DAY + ((hour * 60 + minute - offset) * 60 + sec) * 1000LL;
+    }
+  }
+  static constexpr int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (d > lengths[m - 1] + (m == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))))
+    return BAD;
   y -= m <= 2;
   int era = y / 400, yr = y % 400;
   int days = era * 146097 + yr * 365 + yr / 4 - yr / 100 +
@@ -350,7 +452,8 @@ static void add_mapped(Input& in, const Mapped& mf, size_t chunk_size) {
     in.chunks.push_back({lo, lo + std::min(chunk_size, size_t(tail - lo)), tail, lo == p});
   if (tail < end) {
     size_t n = size_t(end - tail);
-    char* buf = static_cast<char*>(malloc(n + 72));
+    char* buf = static_cast<char*>(malloc(n + 72 + 16)) + 16;  // 16 bytes before
+    memset(buf - 16, ',', 16);
     memcpy(buf, tail, n);
     if (buf[n - 1] != '\n') buf[n++] = '\n';
     memset(buf + n, 0, 64);
@@ -1175,7 +1278,10 @@ static Time manifest_time(const std::string& text, const char* key) {
   if (colon == std::string::npos || a == std::string::npos ||
       b == std::string::npos)
     die("manifest value", key);
-  Time t = timestamp(Text(text).substr(a + 1, b - a - 1));
+  char padded[96] = {};
+  size_t len = std::min<size_t>(b - a - 1, 64);
+  memcpy(padded + 16, text.data() + a + 1, len);
+  Time t = timestamp(Text(padded + 16, len));
   if (t == BAD) die("manifest timestamp", key);
   return t;
 }
@@ -1190,6 +1296,7 @@ static int log2_of(size_t p) { return __builtin_ctzll(p); }
 int main() {
   t_start = now();
   {
+    if (const char* g = getenv("KERNEL_ARENA_GB")) ARENA = size_t(atoi(g)) << 30;
     void* a = mmap(nullptr, ARENA, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (a == MAP_FAILED) die("arena");
@@ -1211,6 +1318,7 @@ int main() {
   G.ws = manifest_time(manifest, "window_start");
   G.we = manifest_time(manifest, "window_end");
   G.day0 = floordiv(G.ws, DAY);
+  init_months(G.day0);
   G.ndays = size_t(floordiv(G.we - 1, DAY) - G.day0 + 1);
 
   constexpr size_t CHUNK = 1 << 20;
