@@ -1,8 +1,4 @@
 **
-!requirements.txt
-!pipeline/
-!pipeline/*.py
 !native/
 !native/*.cpp
 !native/*.hpp
-!run.sh
