@@ -841,6 +841,57 @@ struct Cell {
   int64_t sessions, purchasing, revenue, assisted;
 };
 
+struct PU {  // purchase detail, same key as its event record
+  uint64_t v;
+  uint32_t price, cat, g, pad;
+};
+struct SC2 {
+  uint64_t key;
+  uint32_t camp, idlen;
+  const char* id;
+};
+struct Ck24 {  // valid click from the parse
+  const char* id;
+  uint32_t tsrel, person, camp, idlen;
+};
+
+// Stable LSD radix sort on a key of `bits` bits, 11 bits per pass; passes
+// whose digit is the same for every record are skipped.
+template <class T, class K>
+static void radix_sort(std::vector<T>& a, std::vector<T>& tmp, int bits, K key) {
+  size_t n = a.size();
+  if (n < 2) return;
+  if (n < 64) {
+    std::stable_sort(a.begin(), a.end(),
+                     [&](const T& x, const T& y) { return key(x) < key(y); });
+    return;
+  }
+  tmp.resize(n);
+  int passes = (bits + 10) / 11;
+  static thread_local uint32_t hist[6][2048];
+  memset(hist, 0, sizeof(uint32_t) * 2048 * size_t(passes));
+  for (size_t i = 0; i < n; ++i) {
+    uint64_t k = key(a[i]);
+    for (int d = 0; d < passes; ++d) ++hist[d][(k >> (11 * d)) & 2047];
+  }
+  T* src = a.data();
+  T* dst = tmp.data();
+  uint64_t k0 = key(a[0]);
+  for (int d = 0; d < passes; ++d) {
+    if (hist[d][(k0 >> (11 * d)) & 2047] == n) continue;
+    uint32_t sum = 0;
+    for (int b2 = 0; b2 < 2048; ++b2) {
+      uint32_t c = hist[d][b2];
+      hist[d][b2] = sum;
+      sum += c;
+    }
+    for (size_t i = 0; i < n; ++i)
+      dst[hist[d][(key(src[i]) >> (11 * d)) & 2047]++] = src[i];
+    std::swap(src, dst);
+  }
+  if (src != a.data()) memcpy(static_cast<void*>(a.data()), src, n * sizeof(T));
+}
+
 struct Worker {
   // campaign x day counters
   std::vector<Cell> cells;
@@ -865,6 +916,9 @@ struct Worker {
   std::vector<SE> stage, sorted;
   std::vector<SC> cstage, csorted;
   std::vector<KI> ki, kitmp;
+  std::vector<uint64_t> keys, ktmp;
+  std::vector<PU> pus;
+  std::vector<SC2> cks, cktmp;
 };
 
 struct Global {
@@ -972,6 +1026,112 @@ static void sweep(Worker& W, const Global& G, Text name, const SE* e,
       }
       ++j;
     } while (j < n && e[j].ts - e[j - 1].ts <= GAP);
+    Cell& cc = cell(W, G, day, credit);
+    cc.sessions += 1;
+    cc.purchasing += rev > 0;
+    cc.revenue += rev;
+    usess += 1;
+    uev += int64_t(j - i);
+    urev += rev;
+    ++W.ordinal;
+    i = j;
+  }
+  if (W.wday != INT64_MIN)
+    for (uint32_t a : W.active) charge(W, G, a);
+  for (uint32_t a : W.active) W.count[a] = 0;
+  W.active.clear();
+  flush_user();
+}
+
+// v2 sweep. e: sorted keys (local << 32 | (ts - ws) << 1 | purchase);
+// pu: this partition's purchases in the same key order (cursor advances);
+// c: sorted clicks (key low 32 bits = ts - (ws - 7 days)).
+static void sweep2(Worker& W, const Global& G, Text name, const uint64_t* e,
+                   size_t n, const PU*& pu, const SC2* c, size_t m) {
+  const Time eb = G.ws, cb = G.ws - WEEK;
+  auto ets = [&](size_t k) { return eb + Time(uint32_t(e[k]) >> 1); };
+  auto cts = [&](size_t k) { return cb + Time(uint32_t(c[k].key)); };
+  W.ordinal = 0;
+  W.wday = INT64_MIN;
+  int64_t uday = INT64_MIN, usess = 0, uev = 0, urev = 0;
+  auto flush_user = [&]() {
+    if (uday == INT64_MIN) return;
+    W.u_user.put_str(name);
+    W.u_day.put_i32(int32_t(uday));
+    W.u_sessions.put_i64(usess);
+    W.u_events.put_i64(uev);
+    W.u_revenue.put_i64(urev);
+    uint32_t best = NONE;
+    for (uint32_t k : W.touched) {
+      if (best == NONE || W.catsum[k] > W.catsum[best] ||
+          (W.catsum[k] == W.catsum[best] && G.cat_rank[k] < G.cat_rank[best]))
+        best = k;
+    }
+    W.u_top.present(best != NONE);
+    if (best != NONE) W.u_top.put_str(G.cat_names[best]);
+    for (uint32_t k : W.touched) W.catsum[k] = 0;
+    W.touched.clear();
+    ++W.rows;
+  };
+  size_t i = 0, L = 0, R = 0;
+  while (i < n) {
+    Time S = ets(i), low = S - WEEK;
+    int64_t day = floordiv(S, DAY);
+    if (day != W.wday) {
+      if (W.wday != INT64_MIN)
+        for (uint32_t a : W.active) charge(W, G, a);
+      W.wday = day;
+    }
+    while (L < R && cts(L) < low) {
+      uint32_t a = c[L++].camp;
+      if (--W.count[a] == 0) {
+        charge(W, G, a);
+        uint32_t back = W.active.back();
+        W.active[W.pos[a]] = back;
+        W.pos[back] = W.pos[a];
+        W.active.pop_back();
+      }
+    }
+    if (L == R) {
+      while (R < m && cts(R) < low) ++R;
+      L = R;
+    }
+    while (R < m && cts(R) <= S) {
+      uint32_t a = c[R++].camp;
+      if (W.count[a]++ == 0) {
+        W.first[a] = W.ordinal;
+        W.pos[a] = uint32_t(W.active.size());
+        W.active.push_back(a);
+      }
+    }
+    uint32_t credit = 0;
+    if (L < R) {
+      size_t b = R - 1;
+      Time bt = cts(b);
+      for (size_t k = b; k > L && cts(k - 1) == bt;) {
+        --k;
+        if (Text(c[k].id, c[k].idlen) < Text(c[b].id, c[b].idlen)) b = k;
+      }
+      credit = c[b].camp;
+    }
+    if (day != uday) {
+      flush_user();
+      uday = day;
+      usess = uev = urev = 0;
+    }
+    size_t j = i;
+    int64_t rev = 0;
+    do {
+      if (e[j] & 1) {
+        const PU& x = *pu++;
+        uint32_t p = x.price;
+        rev += p;
+        uint32_t k = x.cat;
+        if (W.catsum[k] == 0) W.touched.push_back(k);
+        W.catsum[k] += p;
+      }
+      ++j;
+    } while (j < n && ets(j) - ets(j - 1) <= GAP);
     Cell& cc = cell(W, G, day, credit);
     cc.sessions += 1;
     cc.purchasing += rev > 0;
@@ -1145,33 +1305,42 @@ int main() {
   }
 
   // Sizing.
+  if ((G.we - G.ws) * 2 >= (Time(1) << 32) || (G.we - (G.ws - WEEK)) >= (Time(1) << 32))
+    die("window longer than this kernel's 32-bit relative times support");
   const size_t P = getenv("KP") ? size_t(atoi(getenv("KP")))
                                 : std::clamp<size_t>(pow2_at_least(events.bytes / (4 << 20)), 64, 2048);
   const int logP = log2_of(P);
   const size_t est_event_lines = events.bytes / 60 + 1024;
   const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 32),
                                          size_t(1) << 22, size_t(1) << 32);
-  const size_t D = std::max(getenv("KD") ? size_t(atoi(getenv("KD"))) : P,
-                            BITS >> 23);  // local bitmap index fits 23 bits
+  const int logBITS = log2_of(BITS);
+  const size_t D = std::max(P, BITS >> 23);  // local bitmap index fits 23 bits
   if (events.chunks.size() >= (size_t(1) << 21)) die("too many event chunks");
   for (auto& c : events.chunks)
     if (size_t(c.end - c.begin) > (size_t(1) << 20)) die("event chunk over 1 MB");
-  const int logBITS = log2_of(BITS);
   const int logLocal = logBITS - log2_of(D);
   const size_t local_bits = size_t(1) << logLocal;
+  // A person's partition comes from its 64-ID group, so its slot inside the
+  // partition is arithmetic (group ordinal * 64 + low bits).
   auto ppart = [&](uint32_t person) {
-    return size_t((person * 2654435761u) >> (32 - logP));
+    return size_t(((person >> 6) * 2654435761u) >> (32 - logP));
   };
+  const size_t nev = events.chunks.size();
+  const Time ws = G.ws, we = G.we, cws = G.ws - WEEK;
+
 
   size_t est_ids = links.bytes / 12 + (events.bytes + clicks.bytes) / 1000 +
                    size_t(T) * IdTable::BLOCK * 2 + 4096;
   IdTable ids;
-  std::vector<SBuf<Ev>> ev;
+  std::vector<SBuf<uint64_t>> ev;
+  std::vector<SBuf<PU>> pu;
+  std::vector<SBuf<Ck24>> ck;
+  std::vector<SBuf<uint32_t>> evg;  // dedup slot of each ev record
   std::vector<DdBuf> dd;
   Stager<Dd> sdd;
-  Stager<Ev> sev;
-  Stager<Ck> sck;
-  std::vector<SBuf<Ck>> ck;
+  Stager<uint32_t> sevg;
+  Stager<uint64_t> sev;
+  Stager<Ck24> sck;
   for (int attempt = 0;; ++attempt) {
     ids.~IdTable();
     new (&ids) IdTable();
@@ -1243,47 +1412,64 @@ int main() {
       });
     }
     mark("links");
-
     // ---- events and clicks
     ev.assign(size_t(T) * P, {});
+    pu.assign(size_t(T) * P, {});
+    ck.assign(size_t(T) * P, {});
+    evg.assign(size_t(T) * P, {});
     dd.assign(size_t(T) * D, {});
     sdd.init(size_t(T) * D);
+    sevg.init(size_t(T) * P);
     sev.init(size_t(T) * P);
     sck.init(size_t(T) * P);
-    ck.assign(size_t(T) * P, {});
     {
       size_t per_ev = est_event_lines * 5 / 4 / (size_t(T) * P) + 64;
       size_t per_ck = clicks.bytes / 50 / (size_t(T) * P) + 16;
       parallel(size_t(T), [&](int, size_t t) {
         for (size_t p = 0; p < P; ++p) {
           ev[t * P + p].reserve(per_ev);
+          evg[t * P + p].reserve(per_ev);
+          pu[t * P + p].reserve(per_ev / 16 + 16);
           ck[t * P + p].reserve(per_ck);
         }
         size_t per_dd = est_event_lines * 5 / 4 / (size_t(T) * D) + 64;
         for (size_t d = 0; d < D; ++d) dd[t * D + d].reserve(per_dd);
       });
     }
-    const size_t nev = events.chunks.size();
-    const Time ws = G.ws, we = G.we, cws = G.ws - WEEK;
     parallel(nev + clicks.chunks.size(), [&](int w, size_t job) {
       Text f[7];
       bool ok;
-      // Rows wait in a small batch so that their ID-slot misses overlap.
+      // Rows wait in a small batch so that their bitmap and ID-slot misses overlap.
       constexpr int BATCH = 16;
-      struct PE { Text user; uint64_t h; Ev e; } pend[BATCH];
-      struct PC { Text user; uint64_t h; Ck c; } cpend[BATCH];
+      struct PE {
+        const char* line;
+        Text user;
+        uint64_t uh;
+        uint32_t g, low, price, cat;
+        bool valid;
+      } pend[BATCH];
+      struct PC {
+        Text user;
+        uint64_t h;
+        Ck24 c;
+      } cpend[BATCH];
       int np = 0;
       auto flush_ev = [&]() {
         for (int k = 0; k < np; ++k) {
-          Ev e = pend[k].e;
-          e.person = ids.get(pend[k].user, pend[k].h, w)->person;
-          sev.put(ev, size_t(w) * P + ppart(e.person), e);
+          const PE& x = pend[k];
+          if (!x.valid) continue;
+          uint32_t person = ids.get(x.user, x.uh, w)->person;
+          uint64_t rec = (uint64_t(person) << 32) | x.low;
+          size_t slot = size_t(w) * P + ppart(person);
+          sev.put(ev, slot, rec);
+          sevg.put(evg, slot, x.g);
+          if (x.low & 1) pu[slot].push({rec, x.price, x.cat, x.g});
         }
         np = 0;
       };
       auto flush_ck = [&]() {
         for (int k = 0; k < np; ++k) {
-          Ck c = cpend[k].c;
+          Ck24 c = cpend[k].c;
           c.person = ids.get(cpend[k].user, cpend[k].h, w)->person;
           sck.put(ck, size_t(w) * P + ppart(c.person), c);
         }
@@ -1295,40 +1481,49 @@ int main() {
           const char* line = p;
           p = split<7>(p, f, ok);
           if (!ok || f[0].empty()) continue;
-          uint64_t h = hash_text(f[0]);
-          uint32_t g = uint32_t(h & (BITS - 1));
+          PE& x = pend[np];
+          x.line = line;
+          x.g = uint32_t(hash_text(f[0]) & (BITS - 1));
           {
-            Dd x;
-            x.v = (uint64_t(g & (local_bits - 1)) << 41) |
-                  (uint64_t(line - c.begin) << 21) | job;
-            sdd.put(dd, size_t(w) * D + (g >> logLocal), x);
+            Dd d2;
+            d2.v = (uint64_t(x.g & (local_bits - 1)) << 41) |
+                   (uint64_t(line - c.begin) << 21) | job;
+            sdd.put(dd, size_t(w) * D + (x.g >> logLocal), d2);
           }
-          if (f[1].empty() || f[5].empty()) continue;
-          uint32_t price = 0;
-          bool purchase = false;
-          Text ty = f[4];
-          if (ty.size() == 4) {
-            if (ty != "view" && ty != "cart") continue;
-          } else if (ty == "purchase") {
-            Time pr = decimal(f[6], 10000000);
-            if (pr < 1) continue;
-            price = uint32_t(pr);
-            purchase = true;
-          } else {
-            continue;
-          }
-          Time ts = timestamp(f[2]);
-          if (ts < ws || ts >= we) continue;
-          Time ingest = timestamp(f[3]);
-          if (ingest - ts > DAY) continue;
-          uint32_t cat = 0;
-          if (purchase) {
-            cat = product.find(f[5]);
-            if (cat == NONE) cat = UNKNOWN_CAT;
-          }
-          uint64_t uh = hash_text(f[1]);
-          __builtin_prefetch(ids.slots + (uh & ids.mask));
-          pend[np++] = {f[1], uh, {ts, 0, price, g, uint16_t(cat), 0}};
+          x.valid = false;
+          ++np;
+          do {
+            if (f[1].empty() || f[5].empty()) break;
+            uint32_t price = 0;
+            bool purchase = false;
+            Text ty = f[4];
+            if (ty.size() == 4) {
+              if (ty != "view" && ty != "cart") break;
+            } else if (ty == "purchase") {
+              Time pr = decimal(f[6], 10000000);
+              if (pr < 1) break;
+              price = uint32_t(pr);
+              purchase = true;
+            } else {
+              break;
+            }
+            Time ts = timestamp(f[2]);
+            if (ts < ws || ts >= we) break;
+            Time ingest = timestamp(f[3]);
+            if (ingest - ts > DAY) break;
+            uint32_t cat = 0;
+            if (purchase) {
+              cat = product.find(f[5]);
+              if (cat == NONE) cat = UNKNOWN_CAT;
+            }
+            x.user = f[1];
+            x.uh = hash_text(f[1]);
+            __builtin_prefetch(ids.slots + (x.uh & ids.mask));
+            x.low = (uint32_t(ts - ws) << 1) | uint32_t(purchase);
+            x.price = price;
+            x.cat = cat;
+            x.valid = true;
+          } while (false);
           if (np == BATCH) flush_ev();
         }
         flush_ev();
@@ -1344,7 +1539,7 @@ int main() {
           if (ts < cws || ts >= we) continue;
           uint64_t uh = hash_text(f[1]);
           __builtin_prefetch(ids.slots + (uh & ids.mask));
-          cpend[np++] = {f[1], uh, {ts, 0, camp, f[0].data(), uint32_t(f[0].size()), 0}};
+          cpend[np++] = {f[1], uh, {f[0].data(), uint32_t(ts - cws), 0, camp, uint32_t(f[0].size())}};
           if (np == BATCH) flush_ck();
         }
         flush_ck();
@@ -1353,19 +1548,19 @@ int main() {
     });
     if (ids.overflow) continue;
     _mm_sfence();
-    sdd.drain(dd);
     sev.drain(ev);
+    sevg.drain(evg);
+    sdd.drain(dd);
     sck.drain(ck);
     break;
   }
   mark("parse");
 
-  // ---- dedup
+  // ---- contested event IDs: exact key, earliest ingest_ts, then validate
   uint64_t* rep = static_cast<uint64_t*>(alloc_zero(BITS / 8));
-  std::vector<AVec<Ev>> winners(size_t(T) * P);
+  std::vector<std::vector<uint64_t>> wev(size_t(T) * P);
+  std::vector<std::vector<PU>> wpu(size_t(T) * P);
   {
-    const size_t wpp = local_bits / 64;
-    std::vector<std::vector<uint64_t>> seen(T);
     struct Best {
       uint64_t h;
       Text key;
@@ -1373,22 +1568,24 @@ int main() {
       const char* line;
     };
     std::vector<std::vector<Best>> table(T);
-    std::vector<std::vector<const char*>> contested(T);
+    std::vector<std::vector<const char*>> lists(T);
+    const size_t wpp = local_bits / 64;
+    std::vector<std::vector<uint64_t>> seenb(T);
     parallel(D, [&](int w, size_t d) {
-      auto& s = seen[w];
-      s.assign(wpp, 0);
+      auto& sb = seenb[w];
+      sb.assign(wpp, 0);
       uint64_t* r = rep + d * wpp;
       for (int t = 0; t < T; ++t)
         for (const Dd& x : dd[size_t(t) * D + d]) {
           uint32_t lc = x.local();
           uint64_t bit = uint64_t(1) << (lc & 63);
-          uint64_t& sw = s[lc >> 6];
+          uint64_t& sw = sb[lc >> 6];
           if (sw & bit)
             r[lc >> 6] |= bit;
           else
             sw |= bit;
         }
-      auto& list = contested[w];
+      auto& list = lists[w];
       list.clear();
       for (int t = 0; t < T; ++t)
         for (const Dd& x : dd[size_t(t) * D + d])
@@ -1453,18 +1650,25 @@ int main() {
           if (cat == NONE) cat = UNKNOWN_CAT;
         }
         uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
-        winners[size_t(w) * P + ppart(person)].push_back(
-            {ts, person, price, 0, uint16_t(cat), 0});
+        uint64_t rec = (uint64_t(person) << 32) | (uint32_t(ts - G.ws) << 1) | uint32_t(purchase);
+        size_t slot = size_t(w) * P + ppart(person);
+        wev[slot].push_back(rec);
+        if (purchase) wpu[slot].push_back({rec, price, cat, 0});
       }
     });
-    std::vector<DdBuf>().swap(dd);
   }
   mark("dedup");
 
   // ---- sessions
   const uint32_t nids = std::min(ids.next.load(), ids.cap);
-  uint32_t* local_of = static_cast<uint32_t*>(alloc_zero(size_t(nids) * 4 + 4));
-  memset(local_of, 0xFF, size_t(nids) * 4);
+  const size_t ngroups = (size_t(nids) + 63) / 64;
+  std::vector<uint32_t> gord(ngroups);
+  std::vector<std::vector<uint32_t>> glist(P);
+  for (size_t g = 0; g < ngroups; ++g) {
+    size_t p = ppart(uint32_t(g << 6));
+    gord[g] = uint32_t(glist[p].size());
+    glist[p].push_back(uint32_t(g));
+  }
   std::vector<Worker> workers(T);
   for (auto& W : workers) {
     W.cells.assign(G.ndays * G.ncamp, Cell{0, 0, 0, 0});
@@ -1483,131 +1687,71 @@ int main() {
   }
   std::vector<std::pair<size_t, size_t>> order(P);
   for (size_t p = 0; p < P; ++p) {
-    size_t s = 0;
-    for (int t = 0; t < T; ++t) s += ev[size_t(t) * P + p].size();
-    order[p] = {s, p};
+    size_t s2 = 0;
+    for (int t = 0; t < T; ++t) s2 += ev[size_t(t) * P + p].size();
+    order[p] = {s2, p};
   }
   std::sort(order.rbegin(), order.rend());
-  // Relative times fit 32 bits whenever the click window spans < ~49 days.
-  const bool fast_sort = (G.we - (G.ws - WEEK)) < (Time(1) << 32);
   mark("sessions-setup");
   parallel(P, [&](int w, size_t job) {
     size_t p = order[job].second;
-    double tjob = now();
     Worker& W = workers[w];
-    auto& li = W.li;
-    auto& cnt = W.cnt;
-    auto& persons = W.persons;
-    auto& stage = W.stage;
-    li.clear();
-    cnt.clear();
-    persons.clear();
-    stage.clear();
-    auto take = [&](const Ev& e) {
-      uint32_t l = local_of[e.person];
-      if (l == NONE) {
-        l = local_of[e.person] = uint32_t(persons.size());
-        persons.push_back(e.person);
-        cnt.push_back(0);
-      }
-      ++cnt[l];
-      li.push_back(l);
-      stage.push_back({e.ts, e.price, e.cat});
+    const auto& gl = glist[p];
+    if (gl.empty()) return;
+    const uint32_t* go = gord.data();
+    auto localize = [go](uint64_t rec) {
+      uint32_t person = uint32_t(rec >> 32);
+      uint64_t local = uint64_t(go[person >> 6]) * 64 + (person & 63);
+      return (local << 32) | uint32_t(rec);
     };
+    int lbits = 1;
+    while ((uint64_t(1) << lbits) < uint64_t(gl.size()) * 64) ++lbits;
+    auto& keys = W.keys;
+    keys.clear();
+    auto& pus = W.pus;
+    pus.clear();
+    auto& cks = W.cks;
+    cks.clear();
     for (int t = 0; t < T; ++t) {
-      const auto& v = ev[size_t(t) * P + p];
-      const size_t nv = v.size();
-      for (size_t k = 0; k < nv; ++k) {
-        if (k + 16 < nv) {
-          __builtin_prefetch(rep + (v[k + 16].slot >> 6));
-          __builtin_prefetch(local_of + v[k + 16].person);
+      {
+        const auto& v = ev[size_t(t) * P + p];
+        const auto& vg = evg[size_t(t) * P + p];
+        const size_t nv = v.size();
+        for (size_t k = 0; k < nv; ++k) {
+          if (k + 16 < nv) __builtin_prefetch(rep + (vg[k + 16] >> 6));
+          uint32_t g = vg[k];
+          if (!((rep[g >> 6] >> (g & 63)) & 1)) keys.push_back(localize(v[k]));
         }
-        const Ev& e = v[k];
-        if (!((rep[e.slot >> 6] >> (e.slot & 63)) & 1)) take(e);
       }
-      for (const Ev& e : winners[size_t(t) * P + p]) take(e);
-    }
-    double tg = now();
-    size_t np = persons.size();
-    if (!np) return;
-    // counting sort events by local person
-    std::vector<uint32_t> start(np + 1);
-    for (size_t k = 0; k < np; ++k) start[k + 1] = start[k] + cnt[k];
-    auto& sorted = W.sorted;
-    sorted.resize(stage.size());
-    {
-      std::vector<uint32_t> at(start.begin(), start.end() - 1);
-      if (fast_sort) {
-        auto& ki = W.ki;
-        ki.resize(stage.size());
-        for (size_t k = 0; k < stage.size(); ++k)
-          ki[k] = {uint32_t(stage[k].ts - G.ws), uint32_t(k)};
-        radix32(ki, W.kitmp);
-        for (const KI& x : ki) sorted[at[li[x.idx]]++] = stage[x.idx];
-      } else {
-        for (size_t k = 0; k < stage.size(); ++k) sorted[at[li[k]]++] = stage[k];
+      for (uint64_t rec : wev[size_t(t) * P + p]) keys.push_back(localize(rec));
+      for (const PU& x : pu[size_t(t) * P + p])
+        if (!((rep[x.g >> 6] >> (x.g & 63)) & 1)) pus.push_back({localize(x.v), x.price, x.cat, 0});
+      for (const PU& x : wpu[size_t(t) * P + p]) pus.push_back({localize(x.v), x.price, x.cat, 0});
+      for (const Ck24& c : ck[size_t(t) * P + p]) {
+        uint64_t local = uint64_t(go[c.person >> 6]) * 64 + (c.person & 63);
+        cks.push_back({(local << 32) | c.tsrel, c.camp, c.idlen, c.id});
       }
     }
-    // clicks
-    double ts1 = now();
-    auto& cli = W.cli;
-    auto& ccnt = W.ccnt;
-    auto& cstage = W.cstage;
-    cli.clear();
-    cstage.clear();
-    ccnt.assign(np, 0);
-    for (int t = 0; t < T; ++t) {
-      const auto& cv = ck[size_t(t) * P + p];
-      for (size_t k = 0; k < cv.size(); ++k) {
-        if (k + 16 < cv.size()) __builtin_prefetch(local_of + cv[k + 16].person);
-        const Ck& c = cv[k];
-        uint32_t l = local_of[c.person];
-        if (l == NONE) continue;
-        ++ccnt[l];
-        cli.push_back(l);
-        cstage.push_back({c.ts, c.camp, c.idlen, c.id});
-      }
+    if (keys.empty()) return;
+    radix_sort(keys, W.ktmp, 32 + lbits, [](uint64_t k) { return k; });
+    std::sort(pus.begin(), pus.end(), [](const PU& a2, const PU& b2) { return a2.v < b2.v; });
+    radix_sort(cks, W.cktmp, 32 + lbits, [](const SC2& x) { return x.key; });
+    const PU* pc = pus.data();
+    size_t n = keys.size(), m = cks.size(), i = 0, ci = 0;
+    while (i < n) {
+      uint32_t local = uint32_t(keys[i] >> 32);
+      size_t j = i + 1;
+      while (j < n && uint32_t(keys[j] >> 32) == local) ++j;
+      while (ci < m && uint32_t(cks[ci].key >> 32) < local) ++ci;
+      size_t cj = ci;
+      while (cj < m && uint32_t(cks[cj].key >> 32) == local) ++cj;
+      uint32_t person = gl[local >> 6] * 64 + (local & 63);
+      sweep2(W, G, ids.strs[person], keys.data() + i, j - i, pc, cks.data() + ci, cj - ci);
+      i = j;
+      ci = cj;
     }
-    std::vector<uint32_t> cstart(np + 1);
-    for (size_t k = 0; k < np; ++k) cstart[k + 1] = cstart[k] + ccnt[k];
-    auto& csorted = W.csorted;
-    csorted.resize(cstage.size());
-    {
-      std::vector<uint32_t> at(cstart.begin(), cstart.end() - 1);
-      if (fast_sort) {
-        auto& ki = W.ki;
-        ki.resize(cstage.size());
-        for (size_t k = 0; k < cstage.size(); ++k)
-          ki[k] = {uint32_t(cstage[k].ts - (G.ws - WEEK)), uint32_t(k)};
-        radix32(ki, W.kitmp);
-        for (const KI& x : ki) csorted[at[cli[x.idx]]++] = cstage[x.idx];
-      } else {
-        for (size_t k = 0; k < cstage.size(); ++k)
-          csorted[at[cli[k]]++] = cstage[k];
-      }
-    }
-    double ts2 = now();
-    for (size_t k = 0; k < np; ++k) {
-      SE* e = sorted.data() + start[k];
-      size_t n = start[k + 1] - start[k];
-      SC* c = csorted.data() + cstart[k];
-      size_t m = cstart[k + 1] - cstart[k];
-      if (!fast_sort) {
-        std::sort(e, e + n, [](const SE& a, const SE& b) { return a.ts < b.ts; });
-        std::sort(c, c + m, [](const SC& a, const SC& b) { return a.ts < b.ts; });
-      }
-      sweep(W, G, ids.strs[persons[k]], e, n, c, m);
-    }
-    double ts3 = now();
-    W.tm[0] += tg - tjob; W.tm[1] += ts1 - tg; W.tm[2] += ts2 - ts1; W.tm[3] += ts3 - ts2;
   });
   mark("sessions");
-  if (verbose) {
-    double tm[4] = {0, 0, 0, 0};
-    for (auto& W : workers) for (int i = 0; i < 4; ++i) tm[i] += W.tm[i];
-    double sw = 0; for (auto& W : workers) sw += W.tm[4];
-    fprintf(stderr, "  cpu: gather %.3f  ev-sort %.3f  clicks %.3f  sort+sweep %.3f  sweep %.3f\n", tm[0], tm[1], tm[2], tm[3], sw);
-  }
 
   // ---- outputs
   std::string ud = out + "/user_daily", cd = out + "/campaign_daily";
