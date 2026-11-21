@@ -530,6 +530,66 @@ struct Dd {
   uint32_t chunk() const { return uint32_t(v & 0x1FFFFF); }
   uint32_t offset() const { return uint32_t((v >> 21) & 0xFFFFF); }
 };
+// Append-only record buffer, 64-byte aligned, filled 8 records at a time with
+// streaming stores from a per-worker staging line (software write-combining).
+template <class R>
+struct SBuf {
+  R* data = nullptr;
+  size_t n = 0, cap = 0;
+  void reserve(size_t c) {
+    c = (c + 7) & ~size_t(7);
+    if (c <= cap) return;
+    R* nd = static_cast<R*>(arena_take(c * sizeof(R)));
+    if (n) memcpy(static_cast<void*>(nd), data, n * sizeof(R));
+    data = nd;
+    cap = c;
+  }
+  void append8(const R* src) {
+    static_assert((8 * sizeof(R)) % 32 == 0, "8 records must be whole vectors");
+    if (n + 8 > cap) reserve(std::max<size_t>(cap * 2, 64));
+    const __m256i* s = reinterpret_cast<const __m256i*>(src);
+    __m256i* d = reinterpret_cast<__m256i*>(data + n);
+    for (size_t i = 0; i < 8 * sizeof(R) / 32; ++i)
+      _mm256_stream_si256(d + i, _mm256_load_si256(s + i));
+    n += 8;
+  }
+  void push(const R& x) {
+    if (n == cap) reserve(std::max<size_t>(cap * 2, 64));
+    data[n++] = x;
+  }
+  size_t size() const { return n; }
+  const R& operator[](size_t i) const { return data[i]; }
+  const R* begin() const { return data; }
+  const R* end() const { return data + n; }
+};
+template <class R>
+struct alignas(64) Line8 {
+  R r[8];
+};
+// Per-worker staging lines for many partitions.
+template <class R>
+struct Stager {
+  std::vector<Line8<R>> lines;
+  std::vector<uint8_t> n;
+  void init(size_t slots) {
+    lines.assign(slots, Line8<R>{});
+    n.assign(slots, 0);
+  }
+  inline void put(std::vector<SBuf<R>>& out, size_t slot, const R& x) {
+    uint8_t& k = n[slot];
+    lines[slot].r[k] = x;
+    if (++k == 8) {
+      out[slot].append8(lines[slot].r);
+      k = 0;
+    }
+  }
+  void drain(std::vector<SBuf<R>>& out) {
+    for (size_t slot = 0; slot < out.size(); ++slot)
+      for (uint8_t k = 0; k < n[slot]; ++k) out[slot].push(lines[slot].r[k]);
+  }
+};
+using DdBuf = SBuf<Dd>;
+
 struct Ck {  // valid click, routed by person
   Time ts;
   uint32_t person, camp;
@@ -1106,9 +1166,12 @@ int main() {
   size_t est_ids = links.bytes / 12 + (events.bytes + clicks.bytes) / 1000 +
                    size_t(T) * IdTable::BLOCK * 2 + 4096;
   IdTable ids;
-  std::vector<AVec<Ev>> ev;
-  std::vector<AVec<Dd>> dd;
-  std::vector<AVec<Ck>> ck;
+  std::vector<SBuf<Ev>> ev;
+  std::vector<DdBuf> dd;
+  Stager<Dd> sdd;
+  Stager<Ev> sev;
+  Stager<Ck> sck;
+  std::vector<SBuf<Ck>> ck;
   for (int attempt = 0;; ++attempt) {
     ids.~IdTable();
     new (&ids) IdTable();
@@ -1184,6 +1247,9 @@ int main() {
     // ---- events and clicks
     ev.assign(size_t(T) * P, {});
     dd.assign(size_t(T) * D, {});
+    sdd.init(size_t(T) * D);
+    sev.init(size_t(T) * P);
+    sck.init(size_t(T) * P);
     ck.assign(size_t(T) * P, {});
     {
       size_t per_ev = est_event_lines * 5 / 4 / (size_t(T) * P) + 64;
@@ -1211,7 +1277,7 @@ int main() {
         for (int k = 0; k < np; ++k) {
           Ev e = pend[k].e;
           e.person = ids.get(pend[k].user, pend[k].h, w)->person;
-          ev[size_t(w) * P + ppart(e.person)].push_back(e);
+          sev.put(ev, size_t(w) * P + ppart(e.person), e);
         }
         np = 0;
       };
@@ -1219,7 +1285,7 @@ int main() {
         for (int k = 0; k < np; ++k) {
           Ck c = cpend[k].c;
           c.person = ids.get(cpend[k].user, cpend[k].h, w)->person;
-          ck[size_t(w) * P + ppart(c.person)].push_back(c);
+          sck.put(ck, size_t(w) * P + ppart(c.person), c);
         }
         np = 0;
       };
@@ -1231,9 +1297,12 @@ int main() {
           if (!ok || f[0].empty()) continue;
           uint64_t h = hash_text(f[0]);
           uint32_t g = uint32_t(h & (BITS - 1));
-          dd[size_t(w) * D + (g >> logLocal)].push_back(
-              {(uint64_t(g & (local_bits - 1)) << 41) |
-               (uint64_t(line - c.begin) << 21) | job});
+          {
+            Dd x;
+            x.v = (uint64_t(g & (local_bits - 1)) << 41) |
+                  (uint64_t(line - c.begin) << 21) | job;
+            sdd.put(dd, size_t(w) * D + (g >> logLocal), x);
+          }
           if (f[1].empty() || f[5].empty()) continue;
           uint32_t price = 0;
           bool purchase = false;
@@ -1263,6 +1332,7 @@ int main() {
           if (np == BATCH) flush_ev();
         }
         flush_ev();
+        _mm_sfence();  // order this worker's streaming stores
       } else {
         const Chunk& c = clicks.chunks[job - nev];
         for (const char* p = first_line(c); p < c.end;) {
@@ -1278,9 +1348,14 @@ int main() {
           if (np == BATCH) flush_ck();
         }
         flush_ck();
+        _mm_sfence();
       }
     });
     if (ids.overflow) continue;
+    _mm_sfence();
+    sdd.drain(dd);
+    sev.drain(ev);
+    sck.drain(ck);
     break;
   }
   mark("parse");
@@ -1382,7 +1457,7 @@ int main() {
             {ts, person, price, 0, uint16_t(cat), 0});
       }
     });
-    std::vector<AVec<Dd>>().swap(dd);
+    std::vector<DdBuf>().swap(dd);
   }
   mark("dedup");
 
@@ -1450,7 +1525,6 @@ int main() {
         const Ev& e = v[k];
         if (!((rep[e.slot >> 6] >> (e.slot & 63)) & 1)) take(e);
       }
-      AVec<Ev>().swap(ev[size_t(t) * P + p]);
       for (const Ev& e : winners[size_t(t) * P + p]) take(e);
     }
     double tg = now();
@@ -1493,7 +1567,6 @@ int main() {
         cli.push_back(l);
         cstage.push_back({c.ts, c.camp, c.idlen, c.id});
       }
-      AVec<Ck>().swap(ck[size_t(t) * P + p]);
     }
     std::vector<uint32_t> cstart(np + 1);
     for (size_t k = 0; k < np; ++k) cstart[k + 1] = cstart[k] + ccnt[k];
