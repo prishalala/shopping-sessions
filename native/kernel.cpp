@@ -1329,8 +1329,16 @@ int main() {
       stage.push_back({e.ts, e.price, e.cat});
     };
     for (int t = 0; t < T; ++t) {
-      for (const Ev& e : ev[size_t(t) * P + p])
+      const auto& v = ev[size_t(t) * P + p];
+      const size_t nv = v.size();
+      for (size_t k = 0; k < nv; ++k) {
+        if (k + 16 < nv) {
+          __builtin_prefetch(rep + (v[k + 16].slot >> 6));
+          __builtin_prefetch(local_of + v[k + 16].person);
+        }
+        const Ev& e = v[k];
         if (!((rep[e.slot >> 6] >> (e.slot & 63)) & 1)) take(e);
+      }
       AVec<Ev>().swap(ev[size_t(t) * P + p]);
       for (const Ev& e : winners[size_t(t) * P + p]) take(e);
     }
@@ -1353,7 +1361,10 @@ int main() {
     cstage.clear();
     ccnt.assign(np, 0);
     for (int t = 0; t < T; ++t) {
-      for (const Ck& c : ck[size_t(t) * P + p]) {
+      const auto& cv = ck[size_t(t) * P + p];
+      for (size_t k = 0; k < cv.size(); ++k) {
+        if (k + 16 < cv.size()) __builtin_prefetch(local_of + cv[k + 16].person);
+        const Ck& c = cv[k];
         uint32_t l = local_of[c.person];
         if (l == NONE) continue;
         ++ccnt[l];
