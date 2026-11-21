@@ -1,57 +1,47 @@
 # Shopping Sessions
 
-This Linux AMD64 image resolves identities, sessionizes events, attributes clicks and writes the two Parquet tables defined in [the track rules](rules.md).
+A single static C++17 binary that implements [the track rules](rules.md): it parses the dirty CSV logs, deduplicates events, joins linked user IDs, builds sessions, attributes clicks and assists, and writes the two Parquet tables directly. The Docker image is `FROM scratch` with only that binary, so container start-up costs almost nothing.
 
-## Run
+## Build and run
 
-Use Docker with Buildx and Python 3.10+ with the pinned Polars version for the local checkers. On Windows, run the shell commands in WSL with access to a Linux Docker daemon. The scorer invokes the image without arguments. The supplied runner mounts the input read-only, disables networking, runs as uid 1000 and gives the container a writable output directory and scratch space.
+The scorer builds the root `Dockerfile` (linux/amd64) and runs the image with no arguments. Inputs come from `DATA_DIR` (default `/data`), outputs go to `OUTPUT_DIR` (default `/output`), and `NCPU` sets the thread count.
 
 ```sh
-python3 -m pip install -r requirements.txt
-make build
-make fixtures
-make regressions
+make build                                   # docker buildx build --platform linux/amd64 --load
+make fixtures                                # all 36 supplied edge-case fixtures, scorer flags
+make regressions                             # 4 extra end-to-end cases
 scripts/docker_run.sh /path/to/input /path/to/empty-output
+python3 scripts/compare.py /path/to/output dev-answer   # exact, order-insensitive diff
 ```
 
-With the published Rust generator on PATH and the public answer extracted into `dev-answer/`, generate and compare the public dataset.
+The checkers need Python 3.10+ with `polars==2.1.0` (`pip install -r requirements.txt`). To build the binary without Docker:
 
 ```sh
-make dev run-dev check-dev
+g++ -O3 -march=x86-64-v3 -std=c++17 -pthread native/kernel.cpp -o kernel
+DATA_DIR=dev OUTPUT_DIR=out ./kernel
 ```
 
-The native stage reads `DATA_DIR` and writes partition summaries under `SCRATCH_DIR`. Polars writes Parquet directly into `OUTPUT_DIR/user_daily/` and `OUTPUT_DIR/campaign_daily/`. Defaults inside the container are `/data`, `/scratch` and `/output`. The runner sets `NCPU=8`, a 24 GB memory limit with swap disabled, a read-only root and a 64 MB temporary filesystem.
+## How it works (`native/kernel.cpp`)
 
-## Implementation
+1. **Input.** Every CSV is memory-mapped and cut into 1 MB byte ranges; each worker skips to the next line start itself, so nothing is touched before parsing begins. Read-ahead hints run on a background thread. Lines are split with AVX2 masks for commas, quotes and LF, enforcing whole-field quoting, the exact field count, and `\r` as an ordinary character.
+2. **Linked IDs.** User IDs are interned in a lock-free open-addressing table whose 32-byte slots hold up to 15 key bytes inline, so an exact hit is one cache line. Links are joined with union-find; each component is named by its byte-wise smallest ID (parallel CAS minimum).
+3. **Events.** Timestamps are validated with 64-bit SWAR checks (all three forms, offsets, calendar limits, ASCII-only digits). Each valid event becomes an 8-byte record (person, relative time, purchase flag), routed to a person partition; purchases keep price and category in a side list.
+4. **Dedup before validation.** Every well-formed event ID sets a bit in a partitioned bitmap. Slots seen twice are "contested": those rows are re-read, grouped by exact key, the earliest `ingest_ts` copy is kept, and only then validated. A rejected earliest copy drops the event. All other rows are unique by construction.
+5. **Sessions and attribution.** Each partition owns whole people. Records are radix-sorted by (person, time); a sweep splits sessions on gaps over 30 minutes, credits the latest click in `[start - 7 days, start]` (ties to the byte-wise smallest `click_id`), and counts distinct assisting campaigns with a sliding window that charges runs of sessions per campaign and day.
+6. **Output.** Parquet is written directly (Thrift compact metadata, PLAIN pages, `DATE` logical type, nullable `top_category`), one `user_daily` file per worker plus one `campaign_daily` file.
 
-1. The C++17 reader memory-maps the inputs and divides them at LF boundaries. It skips each file's header once, checks whole-field quoting and parses Gregorian timestamps and ASCII integers. A weighted union-find tracks the byte-wise minimum name of each component.
-2. Two bitmaps identify event IDs that could occur more than once. A clear repeat bit proves uniqueness. Every contested bit goes through an exact comparison of the full event ID and earliest ingest time. The reader copies contested keys and user IDs into per-worker storage and releases the event mappings before probing the exact tables. An invalid earliest row can still suppress a valid later row.
-3. Workers partition by canonical person, then sort compact events and clicks by person and time. Equal-time clicks sort in reverse ID order so the last eligible click wins the tie. Each session uses its starting UTC day. Active campaign counts track distinct assists. The sweep adds a run of assisted sessions when its last qualifying click expires, the day changes or the person ends.
-4. Polars groups session metrics and purchase categories, resolves revenue ties, combines credited and assist-only campaign rows, and writes Parquet DATE columns. Intermediate text fields are framed to preserve literal carriage returns and leading UTF-8 byte-order marks in IDs.
+`pipeline/` and `native/ingest.cpp` are an earlier Python/Polars implementation kept as an independent cross-check.
 
-The Python-only path provides a smaller-data cross-check with a separate parser and as-of join implementation. Run it with `python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py` outside the image.
+## Validation
 
-## Local benchmarks
+All results are exact row-for-row comparisons with zero missing, extra or duplicate keys.
 
-The supplied Linux AMD64 Docker runner used an eight-CPU quota on an Intel Core i7-1355U under WSL2. The guest had 7.6 GiB of RAM. Elapsed times include Docker startup and runner cleanup. Peaks are the container's cgroup memory high-water marks. These are individual local runs.
+- 36/36 supplied fixtures and 4/4 extra regression cases, in the linux/amd64 image with scorer flags.
+- Public dev set (seed 1, 1M events): matches `dev-answer` (117,038 + 27,400 rows).
+- Seed 37, 20M events: matches the earlier implementation (2,248,281 + 28,014 rows).
+- Seed 73, ~60M events: matches the earlier implementation (6,612,082 + 28,014 rows); peak memory about 10.6 GB.
+- The SWAR timestamp parser was fuzzed against the original scalar parser on 6M generated and mutated strings with zero mismatches.
 
-- Seed 1, 1M requested events and 250K clicks, 96.2 MB of input. The runner took 4.26 seconds and peaked at 195 MiB. The public reference matched all 117,038 user-day and 27,400 campaign-day rows.
-- Seed 37, 20M requested events and 5M clicks, 1.915 GB of input. The runner took 23.66 seconds and peaked at 3,079 MiB.
-- Seed 73, 60M requested events and 15M clicks, 5.606 GB of input. The runner took 52.43 seconds and peaked at 6,267 MiB. Native ingestion and session processing took 41.97 seconds. The pipeline through Parquet output took 49.47 seconds.
+## Acknowledgements
 
-Both larger runs matched an earlier implementation that sessionized with Polars and computed assists with as-of joins. The full-size input contained 62,883,502 physical event data lines, 15,275,551 click data lines and 2,668,329 link data lines, including duplicates and malformed rows. The full-size comparison covered 6,612,082 user-day and 28,014 campaign-day rows. The public dev set has organizer-provided answers. The larger seeds are local benchmarks.
-
-On the 60M input, copying contested key bytes reduced wall time from 95.21 to 52.43 seconds. Sampled container disk reads fell from 24.45 GB to 11.48 GB. The same change increased the measured 20M time from 21.30 to 23.66 seconds.
-
-Reproduce the practice-size input with the published generator.
-
-```sh
-generate --seed 37 --events 20000000 --clicks 5000000 --output bench20
-time scripts/docker_run.sh bench20 out20
-```
-
-For a full-size run use seed 73, 60,000,000 events and 15,000,000 clicks. To fit generation on this host, the local harness spooled generator shards to disk before applying the published shuffle. All 87 dev input files from that harness matched the stock generator byte for byte.
-
-## Submission
-
-After publishing this repository to a public GitHub remote, enter its URL and the full output of `git rev-parse HEAD` on the Shopping Sessions track page. The Dockerfile is at the repository root. The generator, data, answers and build caches are excluded from the submission.
+Built for the Ohio Builders Buildathon 2026, Databricks Shopping Sessions track, from the organizers' starter, rules, fixtures and generator. The eight-digit SWAR conversion follows the well-known technique popularized by Daniel Lemire. The checker scripts use Polars. Developed with AI assistance (OpenAI Codex, then Claude Code).
