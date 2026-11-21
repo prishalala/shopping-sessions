@@ -1086,7 +1086,7 @@ int main() {
 
   // Sizing.
   const size_t P = getenv("KP") ? size_t(atoi(getenv("KP")))
-                                : std::clamp<size_t>(pow2_at_least(events.bytes / (16 << 20)), 32, 2048);
+                                : std::clamp<size_t>(pow2_at_least(events.bytes / (2 << 20)), 64, 4096);
   const int logP = log2_of(P);
   const size_t est_event_lines = events.bytes / 60 + 1024;
   const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 16),
