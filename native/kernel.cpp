@@ -525,9 +525,10 @@ struct Ev {  // valid event, routed by person
 // bits 0-19 chunk, 20-43 offset within chunk, 44-63 local bitmap index.
 struct Dd {
   uint64_t v;
-  uint32_t local() const { return uint32_t(v >> 44); }
-  uint32_t chunk() const { return uint32_t(v & 0xFFFFF); }
-  uint32_t offset() const { return uint32_t((v >> 20) & 0xFFFFFF); }
+  // bits 0-20 chunk, 21-40 offset within chunk, 41-63 local bitmap index
+  uint32_t local() const { return uint32_t(v >> 41); }
+  uint32_t chunk() const { return uint32_t(v & 0x1FFFFF); }
+  uint32_t offset() const { return uint32_t((v >> 21) & 0xFFFFF); }
 };
 struct Ck {  // valid click, routed by person
   Time ts;
@@ -1084,15 +1085,17 @@ int main() {
   }
 
   // Sizing.
-  const size_t P = std::clamp<size_t>(pow2_at_least(events.bytes / (4 << 20)), 64, 2048);
+  const size_t P = getenv("KP") ? size_t(atoi(getenv("KP")))
+                                : std::clamp<size_t>(pow2_at_least(events.bytes / (16 << 20)), 32, 2048);
   const int logP = log2_of(P);
   const size_t est_event_lines = events.bytes / 60 + 1024;
   const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 16),
                                          size_t(1) << 22, size_t(1) << 32);
-  const size_t D = std::max(P, BITS >> 20);  // local bitmap index fits 20 bits
-  if (events.chunks.size() >= (size_t(1) << 20)) die("too many event chunks");
+  const size_t D = std::max(getenv("KD") ? size_t(atoi(getenv("KD"))) : P,
+                            BITS >> 23);  // local bitmap index fits 23 bits
+  if (events.chunks.size() >= (size_t(1) << 21)) die("too many event chunks");
   for (auto& c : events.chunks)
-    if (size_t(c.end - c.begin) >= (size_t(1) << 24)) die("event line over 16 MB");
+    if (size_t(c.end - c.begin) > (size_t(1) << 20)) die("event chunk over 1 MB");
   const int logBITS = log2_of(BITS);
   const int logLocal = logBITS - log2_of(D);
   const size_t local_bits = size_t(1) << logLocal;
@@ -1188,9 +1191,10 @@ int main() {
       parallel(size_t(T), [&](int, size_t t) {
         for (size_t p = 0; p < P; ++p) {
           ev[t * P + p].reserve(per_ev);
-          dd[t * D + p].reserve(per_ev);
           ck[t * P + p].reserve(per_ck);
         }
+        size_t per_dd = est_event_lines * 5 / 4 / (size_t(T) * D) + 64;
+        for (size_t d = 0; d < D; ++d) dd[t * D + d].reserve(per_dd);
       });
     }
     const size_t nev = events.chunks.size();
@@ -1228,8 +1232,8 @@ int main() {
           uint64_t h = hash_text(f[0]);
           uint32_t g = uint32_t(h & (BITS - 1));
           dd[size_t(w) * D + (g >> logLocal)].push_back(
-              {(uint64_t(g & (local_bits - 1)) << 44) |
-               (uint64_t(line - c.begin) << 20) | job});
+              {(uint64_t(g & (local_bits - 1)) << 41) |
+               (uint64_t(line - c.begin) << 21) | job});
           if (f[1].empty() || f[5].empty()) continue;
           uint32_t price = 0;
           bool purchase = false;
