@@ -80,6 +80,42 @@ static void* alloc_zero(size_t bytes) {
   return p;
 }
 
+// Bump arena for the big record buffers: one huge-page-advised virtual region,
+// carved into per-thread slabs. Freeing is a no-op; the process exits soon.
+static char* arena_base;
+static std::atomic<size_t> arena_used{0};
+static constexpr size_t ARENA = size_t(96) << 30, SLAB = size_t(64) << 20;
+static thread_local char* slab_at = nullptr;
+static thread_local char* slab_end = nullptr;
+static void* arena_take(size_t bytes) {
+  bytes = (bytes + 63) & ~size_t(63);
+  if (size_t(slab_end - slab_at) < bytes) {
+    size_t want = std::max(bytes, SLAB);
+    size_t off = arena_used.fetch_add(want);
+    if (off + want > ARENA) die("arena exhausted");
+    slab_at = arena_base + off;
+    slab_end = slab_at + want;
+  }
+  void* p = slab_at;
+  slab_at += bytes;
+  return p;
+}
+template <class T>
+struct ArenaAlloc {
+  using value_type = T;
+  ArenaAlloc() = default;
+  template <class U>
+  ArenaAlloc(const ArenaAlloc<U>&) {}
+  T* allocate(size_t n) { return static_cast<T*>(arena_take(n * sizeof(T))); }
+  void deallocate(T*, size_t) {}
+  template <class U>
+  bool operator==(const ArenaAlloc<U>&) const { return true; }
+  template <class U>
+  bool operator!=(const ArenaAlloc<U>&) const { return false; }
+};
+template <class T>
+using AVec = std::vector<T, ArenaAlloc<T>>;
+
 // ---------------------------------------------------------------- parsing
 
 inline Time decimal(Text s, Time limit) {
@@ -883,6 +919,13 @@ static int log2_of(size_t p) { return __builtin_ctzll(p); }
 
 int main() {
   t_start = now();
+  {
+    void* a = mmap(nullptr, ARENA, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (a == MAP_FAILED) die("arena");
+    madvise(a, ARENA, MADV_HUGEPAGE);
+    arena_base = static_cast<char*>(a);
+  }
   verbose = getenv("KERNEL_QUIET") == nullptr;
   init_cls();
   T = std::clamp(ncpu(), 1, 256);
@@ -995,9 +1038,9 @@ int main() {
   size_t est_ids = links.bytes / 12 + (events.bytes + clicks.bytes) / 1000 +
                    size_t(T) * IdTable::BLOCK * 2 + 4096;
   IdTable ids;
-  std::vector<std::vector<Ev>> ev;
-  std::vector<std::vector<Dd>> dd;
-  std::vector<std::vector<Ck>> ck;
+  std::vector<AVec<Ev>> ev;
+  std::vector<AVec<Dd>> dd;
+  std::vector<AVec<Ck>> ck;
   for (int attempt = 0;; ++attempt) {
     ids.~IdTable();
     new (&ids) IdTable();
@@ -1126,7 +1169,7 @@ int main() {
 
   // ---- dedup
   uint64_t* rep = static_cast<uint64_t*>(alloc_zero(BITS / 8));
-  std::vector<std::vector<Ev>> winners(size_t(T) * P);
+  std::vector<AVec<Ev>> winners(size_t(T) * P);
   {
     const size_t wpp = local_bits / 64;
     std::vector<std::vector<uint64_t>> seen(T);
@@ -1214,7 +1257,7 @@ int main() {
             {ts, person, price, 0, uint16_t(cat), 0});
       }
     });
-    std::vector<std::vector<Dd>>().swap(dd);
+    std::vector<AVec<Dd>>().swap(dd);
   }
   mark("dedup");
 
@@ -1262,7 +1305,7 @@ int main() {
     for (int t = 0; t < T; ++t) {
       for (const Ev& e : ev[size_t(t) * P + p])
         if (!((rep[e.slot >> 6] >> (e.slot & 63)) & 1)) take(e);
-      std::vector<Ev>().swap(ev[size_t(t) * P + p]);
+      AVec<Ev>().swap(ev[size_t(t) * P + p]);
       for (const Ev& e : winners[size_t(t) * P + p]) take(e);
     }
     size_t np = persons.size();
@@ -1291,7 +1334,7 @@ int main() {
         cli.push_back(l);
         cstage.push_back({c.ts, c.camp, c.idlen, c.id});
       }
-      std::vector<Ck>().swap(ck[size_t(t) * P + p]);
+      AVec<Ck>().swap(ck[size_t(t) * P + p]);
     }
     std::vector<uint32_t> cstart(np + 1);
     for (size_t k = 0; k < np; ++k) cstart[k + 1] = cstart[k] + ccnt[k];
