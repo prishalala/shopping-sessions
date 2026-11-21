@@ -1086,10 +1086,10 @@ int main() {
 
   // Sizing.
   const size_t P = getenv("KP") ? size_t(atoi(getenv("KP")))
-                                : std::clamp<size_t>(pow2_at_least(events.bytes / (2 << 20)), 64, 4096);
+                                : std::clamp<size_t>(pow2_at_least(events.bytes / (4 << 20)), 64, 2048);
   const int logP = log2_of(P);
   const size_t est_event_lines = events.bytes / 60 + 1024;
-  const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 16),
+  const size_t BITS = std::clamp<size_t>(pow2_at_least(est_event_lines * 32),
                                          size_t(1) << 22, size_t(1) << 32);
   const size_t D = std::max(getenv("KD") ? size_t(atoi(getenv("KD"))) : P,
                             BITS >> 23);  // local bitmap index fits 23 bits
@@ -1325,7 +1325,12 @@ int main() {
       tb.assign(cap, Best{0, Text(), 0, nullptr});
       Text f[7];
       bool ok;
-      for (const char* line : list) {
+      for (size_t li2 = 0; li2 < list.size(); ++li2) {
+        if (li2 + 8 < list.size()) {
+          __builtin_prefetch(list[li2 + 8]);
+          __builtin_prefetch(list[li2 + 8] + 64);
+        }
+        const char* line = list[li2];
         split<7>(line, f, ok);
         uint64_t h = hash_text(f[0]);
         Time ingest = timestamp(f[3]);
