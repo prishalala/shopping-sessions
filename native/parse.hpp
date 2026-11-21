@@ -9,8 +9,53 @@ using Time = int64_t;
 constexpr Time day_ms = 86400000;
 constexpr Time bad_time = std::numeric_limits<Time>::min();
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+
+// Locate all commas and quotes together, then validate just the special bytes.
+// The final partial vector uses scalar loads and never crosses the mapped file.
+template <size_t N>
+bool vector_fields(Text line, std::array<Text, N>& out) {
+  size_t field = 0, start = 0, quotes = 0;
+  auto finish = [&](size_t end) {
+    if (field == N) return false;
+    Text value = line.substr(start, end - start);
+    if (quotes) {
+      if (quotes != 2 || value.front() != '"' || value.back() != '"') return false;
+      value = value.substr(1, value.size()-2);
+    }
+    out[field++] = value;
+    start = end + 1;
+    quotes = 0;
+    return true;
+  };
+  size_t i = 0;
+  for (; i + 16 <= line.size(); i += 16) {
+    auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(line.data()+i));
+    unsigned commas = _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, _mm_set1_epi8(',')));
+    unsigned marks = _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, _mm_set1_epi8('"')));
+    while (commas) {
+      unsigned bit = commas & -commas;
+      quotes += __builtin_popcount(marks & (bit-1));
+      if (!finish(i + __builtin_ctz(commas))) return false;
+      marks &= ~(bit-1);
+      commas ^= bit;
+    }
+    quotes += __builtin_popcount(marks);
+  }
+  for (; i < line.size(); ++i) {
+    if (line[i] == ',' && !finish(i)) return false;
+    quotes += line[i] == '"';
+  }
+  return finish(line.size()) && field == N;
+}
+#endif
+
 template <size_t N>
 bool fields(Text line, std::array<Text, N>& out) {
+#if defined(__SSE2__)
+  return vector_fields(line, out);
+#else
   for (size_t i = 0; i < N; ++i) {
     size_t sep = line.find(',');
     if ((sep == Text::npos) != (i + 1 == N)) return false;
@@ -25,6 +70,7 @@ bool fields(Text line, std::array<Text, N>& out) {
     if (sep != Text::npos) line.remove_prefix(sep + 1);
   }
   return true;
+#endif
 }
 
 inline Time decimal(Text s, Time limit) {

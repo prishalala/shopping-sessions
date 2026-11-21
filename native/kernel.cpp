@@ -40,7 +40,6 @@ constexpr Time BAD = INT64_MIN;
 constexpr uint32_t NONE = UINT32_MAX;
 
 static int T = 8;
-static int KX = 0;
 
 [[noreturn]] static void die(const char* what, const std::string& detail = {}) {
   fprintf(stderr, "fatal: %s %s\n", what, detail.c_str());
@@ -151,36 +150,59 @@ static void init_cls() {
 }
 
 // Split one LF-terminated line into exactly N fields. Returns the next line.
+// Reads up to 63 bytes past the LF; every chunk is followed by >= 64 readable
+// bytes (see add_mapped).
+#include <immintrin.h>
 template <int N>
 static inline const char* split(const char* p, Text* f, bool& ok) {
-  const char* s = p;
+  const __m256i comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"'),
+                lf = _mm256_set1_epi8('\n');
+  const char* fs = p;  // field start
   int n = 0, q = 0;
   bool bad = false;
-  for (;;) {
-    uint8_t c;
-    while (!(c = cls[uint8_t(*p)])) ++p;
-    if (c == 2) {
-      ++q;
-      ++p;
-      continue;
-    }
+  auto finish = [&](const char* end) {
     if (n < N) {
       if (q) {
-        if (q == 2 && p - s >= 2 && *s == '"' && p[-1] == '"')
-          f[n] = Text(s + 1, size_t(p - s - 2));
+        if (q == 2 && end - fs >= 2 && *fs == '"' && end[-1] == '"')
+          f[n] = Text(fs + 1, size_t(end - fs - 2));
         else
           bad = true;
       } else {
-        f[n] = Text(s, size_t(p - s));
+        f[n] = Text(fs, size_t(end - fs));
       }
     }
     ++n;
     q = 0;
-    if (c == 3) break;
-    s = ++p;
+    fs = end + 1;
+  };
+  for (const char* base = p;; base += 64) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 32));
+    uint64_t mc = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma))) |
+                  (uint64_t(uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)))) << 32);
+    uint64_t mq = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote))) |
+                  (uint64_t(uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)))) << 32);
+    uint64_t ml = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, lf))) |
+                  (uint64_t(uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, lf)))) << 32);
+    uint64_t below = ml ? ((ml & -ml) - 1) : ~uint64_t(0);
+    mc &= below;
+    mq &= below;
+    while (mc) {
+      int pos = __builtin_ctzll(mc);
+      uint64_t lower = (uint64_t(1) << pos) - 1;
+      q += __builtin_popcountll(mq & lower);
+      mq &= ~lower;
+      finish(base + pos);
+      mc &= mc - 1;
+    }
+    q += __builtin_popcountll(mq);
+    if (ml) {
+      const char* end = base + __builtin_ctzll(ml);
+      finish(end);
+      ok = !bad && n == N;
+      return end + 1;
+    }
   }
-  ok = !bad && n == N;
-  return p + 1;
 }
 
 // ---------------------------------------------------------------- hashing
@@ -352,26 +374,49 @@ struct StrMap {
   }
 };
 
-// Lock-free interning table for user IDs. Slot = (tag << 32) | (id + 1).
+// Lock-free interning table for user IDs. One 32-byte slot holds the hash,
+// the person, the ID number and up to 15 key bytes, so an exact hit costs one
+// cache line. Longer keys fall back to comparing strs[id].
+struct alignas(32) IdSlot {
+  uint64_t h;  // 0 empty, 1 being written, else hash | 2
+  uint32_t person, id;
+  __m128i key;  // bytes [0, len) of the ID, zero padded; byte 15 = len or 255
+};
+static inline __m128i key_of(Text s) {
+  static const struct M {
+    uint8_t m[17][16];
+    M() {
+      for (int l = 0; l <= 16; ++l)
+        for (int i = 0; i < 16; ++i) m[l][i] = i < l ? 0xFF : 0;
+    }
+  } masks;
+  size_t n = s.size();
+  __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s.data()));
+  if (n <= 15) {
+    v = _mm_and_si128(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(masks.m[n])));
+    return _mm_or_si128(v, _mm_slli_si128(_mm_cvtsi32_si128(int(n)), 15));
+  }
+  v = _mm_and_si128(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(masks.m[15])));
+  return _mm_or_si128(v, _mm_slli_si128(_mm_cvtsi32_si128(255), 15));
+}
+
 struct IdTable {
-  uint64_t* slots = nullptr;
+  IdSlot* slots = nullptr;
   size_t mask = 0;
   uint32_t cap = 0;
   Text* strs = nullptr;
-  uint32_t* person = nullptr;
+  uint32_t* slot_of = nullptr;
   alignas(64) std::atomic<uint32_t> next{0};
   alignas(64) std::atomic<bool> overflow{false};
   char pad_[64];
 
   void init(size_t nslots) {
-    slots = static_cast<uint64_t*>(alloc_zero(nslots * 8));
+    slots = static_cast<IdSlot*>(alloc_zero(nslots * sizeof(IdSlot)));
     mask = nslots - 1;
     cap = uint32_t(std::min<size_t>(nslots / 2, 0xFFFFFFF0u));
     strs = static_cast<Text*>(alloc_zero(size_t(cap) * sizeof(Text)));
-    person = static_cast<uint32_t*>(alloc_zero(size_t(cap) * 4));
+    slot_of = static_cast<uint32_t*>(alloc_zero(size_t(cap) * 4));
   }
-  // Each worker claims IDs in private blocks: no shared counter traffic and
-  // no false sharing on strs/person between workers.
   static constexpr uint32_t BLOCK = 4096;
   struct alignas(64) Cursor {
     uint32_t at = 0, end = 0;
@@ -390,31 +435,37 @@ struct IdTable {
     }
     return c.at++;
   }
-  uint32_t get(Text s, uint64_t h, int w) {
-    uint32_t tag = uint32_t(h >> 32);
-    size_t i = h & mask;
-    uint32_t mine = NONE;
+  // Returns the slot of s, inserting a new singleton ID if absent.
+  IdSlot* get(Text s, uint64_t hash, int w) {
+    uint64_t h = hash | 2;
+    __m128i k = key_of(s);
+    bool longkey = s.size() > 15;
+    size_t i = hash & mask;
     for (;;) {
-      uint64_t x = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE);
+      IdSlot* sl = slots + i;
+      uint64_t x = __atomic_load_n(&sl->h, __ATOMIC_ACQUIRE);
       if (x == 0) {
-        if (mine == NONE) {
-          mine = claim(w);
-          if (mine == NONE) return 0;
-          strs[mine] = s;
-          person[mine] = mine;
+        if (__atomic_compare_exchange_n(&sl->h, &x, uint64_t(1), false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+          uint32_t id = claim(w);
+          if (id == NONE) id = 0;
+          strs[id] = s;
+          slot_of[id] = uint32_t(i);
+          sl->person = id;
+          sl->id = id;
+          sl->key = k;
+          __atomic_store_n(&sl->h, h, __ATOMIC_RELEASE);
+          return sl;
         }
-        uint64_t nw = (uint64_t(tag) << 32) | (uint64_t(mine) + 1);
-        if (__atomic_compare_exchange_n(slots + i, &x, nw, false,
-                                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
-          return mine;
       }
-      if (uint32_t(x >> 32) == tag && strs[uint32_t(x) - 1] == s) {
-        if (mine != NONE) {  // give the unused ID back to this worker's block
-          strs[mine] = Text();
-          --cursors[w].at;
-        }
-        return uint32_t(x) - 1;
+      while (x == 1) {
+        _mm_pause();
+        x = __atomic_load_n(&sl->h, __ATOMIC_ACQUIRE);
       }
+      if (x == h &&
+          _mm_movemask_epi8(_mm_cmpeq_epi8(sl->key, k)) == 0xFFFF &&
+          (!longkey || strs[sl->id] == s))
+        return sl;
       i = (i + 1) & mask;
     }
   }
@@ -834,7 +885,6 @@ int main() {
   t_start = now();
   verbose = getenv("KERNEL_QUIET") == nullptr;
   init_cls();
-  if (const char* k = getenv("KX")) KX = atoi(k);
   T = std::clamp(ncpu(), 1, 256);
   std::string data = env("DATA_DIR", "/data"), out = env("OUTPUT_DIR", "/output");
 
@@ -951,7 +1001,7 @@ int main() {
   for (int attempt = 0;; ++attempt) {
     ids.~IdTable();
     new (&ids) IdTable();
-    ids.init(pow2_at_least(est_ids * 2) << (2 * attempt));
+    ids.init(pow2_at_least(est_ids) << (2 * attempt));
 
     // ---- links
     {
@@ -959,8 +1009,8 @@ int main() {
       parallel(links.chunks.size(), [&](int w, size_t i) {
         each_row<2>(links.chunks[i], [&](Text* f) {
           if (f[0].empty() || f[1].empty()) return;
-          uint32_t a = ids.get(f[0], hash_text(f[0]), w);
-          uint32_t b = ids.get(f[1], hash_text(f[1]), w);
+          uint32_t a = ids.get(f[0], hash_text(f[0]), w)->id;
+          uint32_t b = ids.get(f[1], hash_text(f[1]), w)->id;
           edges[w].push_back({a, b});
         });
       });
@@ -989,7 +1039,9 @@ int main() {
         uint32_t r = find(i);
         if (r != i && ids.strs[i] < ids.strs[best[r]]) best[r] = i;
       }
-      for (uint32_t i = 0; i < n; ++i) ids.person[i] = best[find(i)];
+      for (uint32_t i = 0; i < n; ++i)
+        if (!ids.strs[i].empty() || best[find(i)] != i)
+          ids.slots[ids.slot_of[i]].person = best[find(i)];
     }
     mark("links");
 
@@ -998,7 +1050,7 @@ int main() {
     dd.assign(size_t(T) * D, {});
     ck.assign(size_t(T) * P, {});
     {
-      size_t per_ev = est_event_lines / 2 / (size_t(T) * P) + 16;
+      size_t per_ev = est_event_lines * 5 / 4 / (size_t(T) * P) + 64;
       size_t per_ck = clicks.bytes / 50 / (size_t(T) * P) + 16;
       parallel(size_t(T), [&](int, size_t t) {
         for (size_t p = 0; p < P; ++p) {
@@ -1020,10 +1072,8 @@ int main() {
         for (const char* p = c.begin; p < c.end;) {
           const char* line = p;
           p = split<7>(p, f, ok);
-          if (KX == 1) continue;
           if (!ok || f[0].empty()) continue;
           uint64_t h = hash_text(f[0]);
-          if (KX == 2) continue;
           uint32_t g = uint32_t(h & (BITS - 1));
           dd[size_t(w) * D + (g >> logLocal)].push_back(
               {uint32_t(g & (local_bits - 1)), 0, line});
@@ -1045,15 +1095,12 @@ int main() {
           if (ts < ws || ts >= we) continue;
           Time ingest = timestamp(f[3]);
           if (ingest - ts > DAY) continue;
-          if (KX == 3) continue;
           uint32_t cat = 0;
           if (purchase) {
             cat = product.find(f[5]);
             if (cat == NONE) cat = UNKNOWN_CAT;
           }
-          uint32_t id = ids.get(f[1], hash_text(f[1]), w);
-          if (KX == 4) continue;
-          uint32_t person = ids.person[id];
+          uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
           ev[size_t(w) * P + ppart(person)].push_back(
               {ts, person, price, g, uint16_t(cat), 0});
         }
@@ -1066,8 +1113,7 @@ int main() {
           if (camp == NONE) continue;
           Time ts = timestamp(f[3]);
           if (ts < cws || ts >= we) continue;
-          uint32_t id = ids.get(f[1], hash_text(f[1]), w);
-          uint32_t person = ids.person[id];
+          uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
           ck[size_t(w) * P + ppart(person)].push_back(
               {ts, person, camp, f[0].data(), uint32_t(f[0].size()), 0});
         }
@@ -1163,8 +1209,7 @@ int main() {
           cat = product.find(f[5]);
           if (cat == NONE) cat = UNKNOWN_CAT;
         }
-        uint32_t id = ids.get(f[1], hash_text(f[1]), w);
-        uint32_t person = ids.person[id];
+        uint32_t person = ids.get(f[1], hash_text(f[1]), w)->person;
         winners[size_t(w) * P + ppart(person)].push_back(
             {ts, person, price, 0, uint16_t(cat), 0});
       }
